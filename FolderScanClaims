@@ -15,6 +15,7 @@ using System.Windows.Forms;
 using System.Collections.Generic;
 using System.Data.SqlClient;
 using System.IO;
+using System.Linq.Expressions;
 #endregion
 
 namespace ST_018a63d276314a01b0cebc43690ba56e
@@ -93,6 +94,8 @@ namespace ST_018a63d276314a01b0cebc43690ba56e
         /// </summary>
         public void Main()
         {
+            SqlTransaction transaction = null;
+            SqlConnection connection = null;
 
             try
             {
@@ -101,89 +104,109 @@ namespace ST_018a63d276314a01b0cebc43690ba56e
                 // List of Payors with their SSIS variable names
                 var payors = new List<Payor>
                 {
-                    new Payor("CSHHPCMH", "User::SourceCSHHPCMH", "User::DestPCMH", "User::SchemaCSHHPCMH"),
-                    new Payor("FHPCMH", "User::SourceFHPCMH", "User::DestPCMH", "User::SchemaFHPCMH"),
-                    new Payor("NEMGPCMH", "User::SourceNEMGPCMH", "User::DestPCMH", "User::SchemaNEMGPCMH"),
-                    new Payor("NEMGUHC", "User::SourceNEMGUHC", "User::DestUHC", "User::SchemaNEMGUHC"),
-                    new Payor("NEMGWellcare", "User::SourceNEMGWellcare", "User::DestWellcare", "User::SchemaNEMGWellcare"),
+                    new Payor("CSHH_PCMH",     "User::SourceCSHHPCMH",     "User::DestPCMH",     "User::SchemaCSHHPCMH"),
+                    new Payor("FH_PCMH",       "User::SourceFHPCMH",       "User::DestPCMH",     "User::SchemaFHPCMH"),
+                    new Payor("NEMG_PCMH",     "User::SourceNEMGPCMH",     "User::DestPCMH",     "User::SchemaNEMGPCMH"),
+                    new Payor("NEMG_UHC",      "User::SourceNEMGUHC",      "User::DestUHC",      "User::SchemaNEMGUHC"),
+                    new Payor("NEMG_Wellcare", "User::SourceNEMGWellcare", "User::DestWellcare", "User::SchemaNEMGWellcare")
 
                 };
+
+                string connectionString = Dts.Variables["User::ProjectClaimsConnection"].Value.ToString();
+                string sqlTableName = Dts.Variables["User::SQLTableName"].Value.ToString();
+
+                connection = new SqlConnection(connectionString);
+                connection.Open();
+
+                // Start a transaction
+                transaction = connection.BeginTransaction();
 
                 foreach (var payor in payors)
                 {
                     string sourceDirectory = Dts.Variables[payor.SourceVariable].Value.ToString();
                     string destinationDirectory = Dts.Variables[payor.DestinationVariable].Value.ToString();
-                    string connectionString = Dts.Variables["User::ProjectClaimsConnection"].Value.ToString();
-                    string sqlTableName = Dts.Variables["User::SQLTableName"].Value.ToString();
                     int schemaId = (int)Dts.Variables[payor.SchemaIdVariable].Value;
 
-                    using (SqlConnection connection = new SqlConnection(connectionString))
+                    // Retrieve the list of file names from the SQL Server table
+                    string query = $"SELECT FileName FROM {sqlTableName} WHERE SchemaId = @SchemaId";
+                    SqlCommand command = new SqlCommand(query, connection, transaction);
+                    command.Parameters.AddWithValue("@SchemaId", schemaId);
+                    SqlDataReader reader = command.ExecuteReader();
+
+                    // Create a HashSet to store the existing file names
+                    var existingFiles = new HashSet<string>();
+
+                    while (reader.Read())
                     {
-                        connection.Open();
+                        string fileName = reader.GetString(0);
+                        existingFiles.Add(fileName);
+                    }
 
-                        // Retrieve the list of file names from the SQL Server table
-                        string query = $"SELECT FileName FROM {sqlTableName} WHERE SchemaId = @SchemaId";
-                        SqlCommand command = new SqlCommand(query, connection);
-                        command.Parameters.AddWithValue("@SchemaId", schemaId);
-                        SqlDataReader reader = command.ExecuteReader();
+                    reader.Close();
 
-                        // Create a HashSet to store the existing file names
-                        var existingFiles = new HashSet<string>();
+                    // Check each file in the source directory
+                    foreach (string filePath in Directory.GetFiles(sourceDirectory))
+                    {
+                        string fileName = Path.GetFileName(filePath);
 
-                        while (reader.Read())
+                        try
                         {
-                            string fileName = reader.GetString(0);
-                            existingFiles.Add(fileName);
+                            // Check if the file already exists in the SQL Server table
+                            if (!existingFiles.Contains(fileName))
+                            {
+                                // Insert the new file, current datetime, and PayorId into the SQL Server table
+                                query = $"INSERT INTO {sqlTableName} (SchemaId, SchemaName, FileName, CopiedDate) VALUES (@SchemaId, @SchemaName, @FileName, @InsertDateTime)";
+                                command = new SqlCommand(query, connection, transaction);
+                                command.Parameters.AddWithValue("@SchemaId", schemaId);
+                                command.Parameters.AddWithValue("@SchemaName", payor.Name);
+                                command.Parameters.AddWithValue("@FileName", fileName);
+                                command.Parameters.AddWithValue("@InsertDateTime", DateTime.Now);
+                                command.ExecuteNonQuery();
+
+                                // Then copy if the file already exists in the SQL Server table
+                                string destinationPath = Path.Combine(destinationDirectory, fileName);
+                                File.Copy(filePath, destinationPath);
+
+                                bool fireAgain = true;
+                                Dts.Events.FireInformation(0, "SSIS", $"File '{fileName}' copied and recorded successfully for {payor.Name}.", "", 0, ref fireAgain);
+
+                                //Log success
+                                LogMessage(connectionString, payor.Name, $"File '{fileName}' coped and recorded successfully for {payor.Name}.", false);
+                            }
                         }
-
-                        reader.Close();
-
-                        // Check each file in the source directory
-                        foreach (string filePath in Directory.GetFiles(sourceDirectory))
+                        catch (Exception ex)
                         {
-                            string fileName = Path.GetFileName(filePath);
-
-                            try
-                            {
-                                // Check if the file already exists in the SQL Server table
-                                if (!existingFiles.Contains(fileName))
-                                {
-                                    // Then copy if the file already exists in the SQL Server table
-                                    string destinationPath = Path.Combine(destinationDirectory, fileName);
-                                    File.Copy(filePath, destinationPath);
-
-                                    Console.WriteLine($"File '{fileName}' copied successfully for {payor.Name}.");
-
-                                    // Insert the new file, current datetime, and PayorId into the SQL Server table
-                                    query = $"INSERT INTO {sqlTableName} (SchemaId, FileName, CopiedDate) VALUES (@SchemaId, @FileName, @InsertDateTime)";
-                                    command = new SqlCommand(query, connection);
-                                    command.Parameters.AddWithValue("@SchemaId", schemaId);
-                                    command.Parameters.AddWithValue("@FileName", fileName);
-                                    command.Parameters.AddWithValue("@InsertDateTime", DateTime.Now);
-                                    command.ExecuteNonQuery();
-
-                                    Console.WriteLine($"File '{fileName}' inserted into the SQL Server table with datetime and PayorId for {payor.Name}.");
-
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"An error occured: {ex.Message}");
-                                // Log the error in the ETL.Claims_ErrorLog table
-                                LogError(connection, packageName, ex.Message);
-                                Dts.TaskResult = (int)ScriptResults.Failure;
-                            }
-
+                            Dts.Events.FireError(0, "SSIS", $"An error occured: {ex.Message}", "", 0);
+                            // Log the error in the ETL.Claims_ErrorLog table
+                            LogMessage(connectionString, payor.Name, ex.Message, true);
+                            throw; //Rethrow the exception to trigger the transaction rollback
                         }
                     }
                 }
+
+                // Commit the transaction if all opertions are successful
+                transaction.Commit();
+                Dts.TaskResult = (int)ScriptResults.Success;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"An error occured: {ex.Message}");
+                // Rollback the transaction in case of an exceptions
+                if (transaction != null)
+                {
+                    transaction.Rollback();
+                }
+
+                Dts.Events.FireError(0, "SSIS", $"An error occured: {ex.Message}", "", 0);
                 Dts.TaskResult = (int)ScriptResults.Failure;
             }
-
+            finally
+            {
+                // Close the connection
+                if (connection != null)
+                {
+                    connection.Close();
+                }
+            }
         }
 
         private class Payor
@@ -205,35 +228,34 @@ namespace ST_018a63d276314a01b0cebc43690ba56e
             }
         }
 
-        private void LogError(SqlConnection connection, string projectName, string errorMessage)
+        private void LogMessage(string connectionString, string projectName, string message, bool isError)
         {
-            string errorLogQuery = "INSERT INTO ETL.Claims_ErrorLog (LogTimeStamp, PackageName, Message, IsError) VALUES (@LogTimeStamp, @PackageName, @Message, @IsError)";
+            string logQuery = "INSERT INTO ETL.Claims_Log (LogTimeStamp, PackageName, Message, IsError) VALUES (@LogTimeStamp, @PackageName, @Message, @IsError)";
 
-            using (SqlCommand errorLogCommand = new SqlCommand(errorLogQuery, connection))
+            using (SqlConnection logConnection = new SqlConnection(connectionString))
             {
-                errorLogCommand.Parameters.AddWithValue("@LogTimeStamp", DateTime.Now);
-                errorLogCommand.Parameters.AddWithValue("@PackageName", projectName);
-                errorLogCommand.Parameters.AddWithValue("@Message", errorMessage);
-                errorLogCommand.Parameters.AddWithValue("@IsError", 1); //Hardcoded value.
-                errorLogCommand.ExecuteNonQuery();
+                logConnection.Open();
 
+                using (SqlCommand logCommand = new SqlCommand(logQuery, logConnection))
+                {
+                    try
+                    {
+                        logCommand.Parameters.AddWithValue("@LogTimeStamp", DateTime.Now);
+                        logCommand.Parameters.AddWithValue("@PackageName", projectName);
+                        logCommand.Parameters.AddWithValue("@Message", message);
+                        logCommand.Parameters.AddWithValue("@IsError", isError ? 1 : 0);
+                        bool fireAgain = true;
+                        Dts.Events.FireInformation(0, "SSIS", $"Attempt to log message: {message}", "", 0, ref fireAgain);
+                        logCommand.ExecuteNonQuery();
+                        Dts.Events.FireInformation(0, "SSIS", $"Log message executed successfully. Message: {message}, IsError {isError}", "", 0, ref fireAgain);
+                    }
+                    catch (Exception ex)
+                    {
+                        Dts.Events.FireError(0, "SSIS", $"Failed to log message: {ex.Message}", "", 0);
+                    }
+                }
             }
         }
-
-        //private void LogSuccess(SqlConnection connection, string packageName, string successMessage)
-        //{
-        //    string logQuery = "INSERT INTO ETL.Claims_Log (LogTimeStamp, PackageName, Message, IsError) VALUES (@LogTimeStamp, @PackageName, @Messagem @IsError)";
-
-        //    using (SqlCommand logCommand = new SqlCommand(logQuery, connection))
-        //    {
-        //        logCommand.Parameters.AddWithValue("@LogTimeStamp", DateTime.Now);
-        //        logCommand.Parameters.AddWithValue("@PackageName", packageName);
-        //        logCommand.Parameters.AddWithValue("@Message", successMessage);
-        //        logCommand.Parameters.AddWithValue("@IsError", 0); //Hardcoded value.
-        //        logCommand.ExecuteNonQuery();
-
-        //    }
-        //}
 
         #region ScriptResults declaration
         /// <summary>
