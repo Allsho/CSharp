@@ -1,0 +1,54 @@
+using System;
+using System.Data;
+using Microsoft.SqlServer.Dts.Runtime;
+using System.Text; // For StringBuilder
+
+public void Main()
+{
+    // Fetch the Recordset variable (which contains the query result)
+    DataTable dt = new DataTable();
+    object obj = Dts.Variables["User::TableStatus"].Value;
+
+    // Create a modern HTML structure for the email body
+    StringBuilder emailBody = new StringBuilder();
+    emailBody.Append("<html><head>");
+    emailBody.Append("<style>");
+    emailBody.Append("body { font-family: Arial, sans-serif; background-color: #f4f4f4; padding: 20px; }");
+    emailBody.Append(".container { max-width: 600px; margin: 0 auto; background-color: #ffffff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1); }");
+    emailBody.Append("h3 { color: #333333; font-size: 24px; }");
+    emailBody.Append("table { width: 100%; border-collapse: collapse; margin-top: 20px; }");
+    emailBody.Append("th, td { padding: 12px; text-align: left; border-bottom: 1px solid #dddddd; }");
+    emailBody.Append("th { background-color: #007bff; color: white; }");
+    emailBody.Append("tr:nth-child(even) { background-color: #f9f9f9; }");
+    emailBody.Append("td { color: #333333; font-size: 14px; }");
+    emailBody.Append("</style>");
+    emailBody.Append("</head><body>");
+    
+    // Container div for clean layout
+    emailBody.Append("<div class='container'>");
+
+    // Email header
+    emailBody.Append("<h3>Table Status Report</h3>");
+    emailBody.Append("<p>This report provides the current status of the tables in your database.</p>");
+
+    // HTML Table structure
+    emailBody.Append("<table>");
+    emailBody.Append("<tr><th>Table Name</th><th>Status</th></tr>");
+
+    // Add each row from the Recordset to the HTML table
+    foreach (DataRow row in dt.Rows)
+    {
+        emailBody.Append("<tr>");
+        emailBody.Append("<td>" + row["TableName"].ToString() + "</td>");
+        emailBody.Append("<td>" + row["Status"].ToString() + "</td>");
+        emailBody.Append("</tr>");
+    }
+
+    emailBody.Append("</table>");
+    emailBody.Append("</div>"); // End of container div
+    emailBody.Append("</body></html>");
+
+    // Save the email body to a variable
+    Dts.Variables["User::EmailBody"].Value = emailBody.ToString();
+    Dts.TaskResult = (int)ScriptResults.Success;
+}
