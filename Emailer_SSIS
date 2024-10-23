@@ -1,0 +1,57 @@
+using System;
+using System.Data;
+using Microsoft.SqlServer.Dts.Runtime;
+using System.Windows.Forms;  // For MessageBox (for testing)
+
+public void Main()
+{
+    try
+    {
+        // Fetch the Recordset variable (User::TableStatus) which contains the query result
+        object obj = Dts.Variables["User::TableStatus"].Value;
+
+        // Check if the object is null
+        if (obj == null)
+        {
+            MessageBox.Show("The Recordset variable 'User::TableStatus' is null.");
+            Dts.TaskResult = (int)ScriptResults.Failure;
+            return;
+        }
+
+        // Create a DataTable to hold the data
+        DataTable dt = new DataTable();
+
+        // Use OleDbDataAdapter to load the Recordset into a DataTable
+        OleDbDataAdapter oleDbAdapter = new OleDbDataAdapter();
+        oleDbAdapter.Fill(dt, (System.Data.OleDb.OleDbDataReader)obj);
+
+        // Check if rows are populated
+        if (dt.Rows.Count > 0)
+        {
+            // Loop through the DataTable to verify that data is loaded correctly
+            foreach (DataRow row in dt.Rows)
+            {
+                // For debugging: Show the SchemaName, TableName, DesignAnalysis, and HasEffectiveKey in a message box
+                string schemaName = row["SchemaName"].ToString();
+                string tableName = row["TableName"].ToString();
+                string designAnalysis = row["DesignAnalysis"].ToString();
+                string hasEffectiveKey = row["HasEffectiveKey"].ToString();
+
+                // Display the values for debugging
+                MessageBox.Show($"Schema: {schemaName}, Table: {tableName}, Design Analysis: {designAnalysis}, Has Effective Key: {hasEffectiveKey}");
+            }
+        }
+        else
+        {
+            MessageBox.Show("The DataTable has no rows.");
+        }
+
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+    catch (Exception ex)
+    {
+        // For debugging: Show any exception message in a message box
+        MessageBox.Show("An error occurred: " + ex.Message);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+    }
+}
