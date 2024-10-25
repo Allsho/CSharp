@@ -2,23 +2,41 @@ using System;
 using System.Data;
 using System.Text;
 using Microsoft.SqlServer.Dts.Runtime;
-using System.Collections;
+using System.Data.OleDb;
 
 public void Main()
 {
-    // Retrieve the recordset variable
-    Object obj = Dts.Variables["User::TableInfoRecordset"].Value;
-    DataTable dt = new DataTable();
-    
-    // Load data from the recordset into a DataTable for easy processing
-    using (OleDbDataAdapter adapter = new OleDbDataAdapter())
+    // Retrieve the recordset object
+    Object recordsetObj = Dts.Variables["User::TableInfoRecordset"].Value;
+
+    // Check if the Recordset variable is null
+    if (recordsetObj == null)
     {
-        adapter.Fill(dt, obj as IEnumerable);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+        return;
     }
 
-    // Use StringBuilder to build the email body dynamically
+    // Load data from the recordset into a DataTable
+    DataTable dt = new DataTable();
+    try
+    {
+        // Initialize the OleDbDataAdapter to fill the DataTable from the recordset
+        using (OleDbDataAdapter adapter = new OleDbDataAdapter())
+        {
+            // Convert the object to ADODB.Recordset and fill the DataTable
+            adapter.Fill(dt, recordsetObj as System.Collections.IEnumerable);
+        }
+    }
+    catch (Exception ex)
+    {
+        Dts.Events.FireError(0, "Script Task", $"Error loading data from Recordset: {ex.Message}", string.Empty, 0);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+        return;
+    }
+
+    // Build the email content
     StringBuilder emailBody = new StringBuilder();
-    
+
     // Add column headers
     foreach (DataColumn column in dt.Columns)
     {
@@ -36,7 +54,7 @@ public void Main()
         emailBody.AppendLine();
     }
 
-    // Store the email content in the EmailBody variable
+    // Set the email content in the EmailBody variable
     Dts.Variables["User::EmailBody"].Value = emailBody.ToString();
 
     Dts.TaskResult = (int)ScriptResults.Success;
