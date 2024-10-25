@@ -2,44 +2,66 @@ using System;
 using System.Data;
 using System.Text;
 using Microsoft.SqlServer.Dts.Runtime;
-using ADODB;  // Ensure the ADODB namespace is referenced
 
 public void Main()
 {
-    // Retrieve the Recordset
-    Recordset recordset = (Recordset)Dts.Variables["User::TableInfoRecordset"].Value;
+    // Retrieve the Recordset variable and verify it's not null
+    object recordsetObj = Dts.Variables["User::TableInfoRecordset"].Value;
 
-    // Check if the Recordset is null
-    if (recordset == null)
+    if (recordsetObj == null)
     {
-        Dts.Events.FireError(0, "Script Task", "The recordset is null. Ensure the Recordset Destination is correctly populated.", string.Empty, 0);
+        Dts.Events.FireError(0, "Script Task", "Recordset is null. Ensure it was populated correctly.", string.Empty, 0);
         Dts.TaskResult = (int)ScriptResults.Failure;
         return;
     }
 
-    // Initialize a StringBuilder to construct the email body
+    // Create a DataTable to load the recordset data
+    DataTable dt = new DataTable();
+
+    // Load the recordset data into a DataTable
+    System.Collections.IEnumerator enumerator = (recordsetObj as System.Collections.IEnumerable).GetEnumerator();
+    bool headersAdded = false;
+
+    // Loop through each row in the recordset
+    while (enumerator.MoveNext())
+    {
+        object[] rowValues = (object[])enumerator.Current;
+
+        // If headers haven't been added, add column headers dynamically
+        if (!headersAdded)
+        {
+            for (int i = 0; i < rowValues.Length; i++)
+            {
+                dt.Columns.Add("Column" + (i + 1)); // Replace with actual column names if needed
+            }
+            headersAdded = true;
+        }
+
+        // Add the current row to the DataTable
+        dt.Rows.Add(rowValues);
+    }
+
+    // Build the email body content
     StringBuilder emailBody = new StringBuilder();
 
-    // Add column headers
-    for (int i = 0; i < recordset.Fields.Count; i++)
+    // Add column headers to the email body
+    foreach (DataColumn column in dt.Columns)
     {
-        emailBody.Append(recordset.Fields[i].Name + "\t");
+        emailBody.Append(column.ColumnName + "\t");
     }
     emailBody.AppendLine();
 
-    // Add each row from the recordset
-    recordset.MoveFirst();
-    while (!recordset.EOF)
+    // Add each row's data to the email body
+    foreach (DataRow row in dt.Rows)
     {
-        for (int i = 0; i < recordset.Fields.Count; i++)
+        foreach (var item in row.ItemArray)
         {
-            emailBody.Append(recordset.Fields[i].Value.ToString() + "\t");
+            emailBody.Append(item.ToString() + "\t");
         }
         emailBody.AppendLine();
-        recordset.MoveNext();
     }
 
-    // Store the email content in the EmailBody variable
+    // Set the email body in the SSIS variable
     Dts.Variables["User::EmailBody"].Value = emailBody.ToString();
 
     Dts.TaskResult = (int)ScriptResults.Success;
