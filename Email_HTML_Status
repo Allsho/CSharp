@@ -2,59 +2,44 @@ using System;
 using System.Data;
 using System.Text;
 using Microsoft.SqlServer.Dts.Runtime;
-using System.Data.OleDb;
+using ADODB;  // Ensure the ADODB namespace is referenced
 
 public void Main()
 {
-    // Retrieve the recordset object
-    Object recordsetObj = Dts.Variables["User::TableInfoRecordset"].Value;
+    // Retrieve the Recordset
+    Recordset recordset = (Recordset)Dts.Variables["User::TableInfoRecordset"].Value;
 
-    // Check if the Recordset variable is null
-    if (recordsetObj == null)
+    // Check if the Recordset is null
+    if (recordset == null)
     {
+        Dts.Events.FireError(0, "Script Task", "The recordset is null. Ensure the Recordset Destination is correctly populated.", string.Empty, 0);
         Dts.TaskResult = (int)ScriptResults.Failure;
         return;
     }
 
-    // Load data from the recordset into a DataTable
-    DataTable dt = new DataTable();
-    try
-    {
-        // Initialize the OleDbDataAdapter to fill the DataTable from the recordset
-        using (OleDbDataAdapter adapter = new OleDbDataAdapter())
-        {
-            // Convert the object to ADODB.Recordset and fill the DataTable
-            adapter.Fill(dt, recordsetObj as System.Collections.IEnumerable);
-        }
-    }
-    catch (Exception ex)
-    {
-        Dts.Events.FireError(0, "Script Task", $"Error loading data from Recordset: {ex.Message}", string.Empty, 0);
-        Dts.TaskResult = (int)ScriptResults.Failure;
-        return;
-    }
-
-    // Build the email content
+    // Initialize a StringBuilder to construct the email body
     StringBuilder emailBody = new StringBuilder();
 
     // Add column headers
-    foreach (DataColumn column in dt.Columns)
+    for (int i = 0; i < recordset.Fields.Count; i++)
     {
-        emailBody.Append(column.ColumnName + "\t");
+        emailBody.Append(recordset.Fields[i].Name + "\t");
     }
     emailBody.AppendLine();
 
-    // Add rows of data
-    foreach (DataRow row in dt.Rows)
+    // Add each row from the recordset
+    recordset.MoveFirst();
+    while (!recordset.EOF)
     {
-        foreach (var item in row.ItemArray)
+        for (int i = 0; i < recordset.Fields.Count; i++)
         {
-            emailBody.Append(item.ToString() + "\t");
+            emailBody.Append(recordset.Fields[i].Value.ToString() + "\t");
         }
         emailBody.AppendLine();
+        recordset.MoveNext();
     }
 
-    // Set the email content in the EmailBody variable
+    // Store the email content in the EmailBody variable
     Dts.Variables["User::EmailBody"].Value = emailBody.ToString();
 
     Dts.TaskResult = (int)ScriptResults.Success;
