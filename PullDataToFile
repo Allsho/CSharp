@@ -1,0 +1,129 @@
+using System;
+using System.Data;
+using System.Data.SqlClient;
+using System.IO;
+using System.Text;
+using System.Collections.Generic;
+using Microsoft.SqlServer.Dts.Runtime;
+
+public class ScriptMain
+{
+    // Variables
+    private int _fileCounter;
+    private int _bytesWritten;
+    private StringBuilder _buffer;
+    private TextWriter _tw;
+    private bool _headerWritten;
+
+    public void Main()
+    {
+        // Initialize settings
+        _fileCounter = 1;
+        _bytesWritten = 0;
+        _buffer = new StringBuilder();
+        _headerWritten = false;
+
+        // Connection string and stored procedure name
+        string connectionString = Dts.Variables["User::ConnectionString"].Value.ToString();
+        string storedProcedureName = Dts.Variables["User::StoredProcedureName"].Value.ToString();
+
+        // Call the stored procedure and retrieve data
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand(storedProcedureName, conn))
+            {
+                cmd.CommandType = CommandType.StoredProcedure;
+                
+                // Execute the stored procedure
+                using (SqlDataReader reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        // Write header if it's the first row
+                        if (!_headerWritten)
+                        {
+                            WriteHeader(reader);
+                            _headerWritten = true;
+                        }
+
+                        // Write each row to the buffer
+                        WriteRow(reader);
+
+                        // Check if file size limit is reached and handle file splitting
+                        if (_bytesWritten >= Convert.ToInt32(Dts.Variables["User::MaxFileLength"].Value))
+                        {
+                            FlushBuffer();
+                            _fileCounter += 1;
+                            _bytesWritten = 0;
+                            _headerWritten = false; // Reset header for the next file
+                        }
+                    }
+
+                    // Final flush to write remaining data
+                    FlushBuffer();
+                }
+            }
+        }
+
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+
+    private TextWriter CurrentWriter
+    {
+        get
+        {
+            if (_tw == null)
+            {
+                string fileName = String.Format(Dts.Variables["User::FileNamePattern"].Value.ToString(), _fileCounter);
+                string filePath = Path.Combine(Dts.Variables["User::OutputFolder"].Value.ToString(), fileName);
+                _tw = File.CreateText(filePath);
+            }
+            return _tw;
+        }
+    }
+
+    private void WriteHeader(SqlDataReader reader)
+    {
+        var headers = new List<string>();
+        for (int i = 0; i < reader.FieldCount; i++)
+        {
+            headers.Add(reader.GetName(i));
+        }
+        _buffer.AppendLine(string.Join(",", headers));
+    }
+
+    private void WriteRow(SqlDataReader reader)
+    {
+        var values = new List<string>();
+        for (int i = 0; i < reader.FieldCount; i++)
+        {
+            string value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString().Replace("\"", "'"); // Handle NULLs
+            values.Add($"\"{value}\"");
+        }
+        string row = string.Join(",", values);
+        _buffer.AppendLine(row);
+        _bytesWritten += row.Length;
+    }
+
+    private void FlushBuffer()
+    {
+        if (_buffer.Length > 0)
+        {
+            this.CurrentWriter.Write(_buffer.ToString());
+            _tw.Flush();
+            _buffer.Clear();
+            if (_tw != null)
+            {
+                _tw.Close();
+                _tw = null;
+            }
+        }
+    }
+
+    enum ScriptResults
+    {
+        Success = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Success,
+        Failure = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Failure
+    }
+}
