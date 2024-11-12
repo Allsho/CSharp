@@ -67,8 +67,6 @@ public void Main()
     }
     catch (Exception ex)
     {
-        // Log error to SSIS and/or a SQL Server table
-        LogError(ex.Message, connectionString);
         Dts.TaskResult = (int)ScriptResults.Failure;
     }
     finally
@@ -117,18 +115,4 @@ private void FlushBuffer(ref TextWriter tw, StringBuilder buffer, ref int fileCo
 
     buffer.Clear();
     fileCounter++;
-}
-
-// Optional error logging function to SQL Server
-private void LogError(string errorMessage, string connectionString)
-{
-    using (SqlConnection conn = new SqlConnection(connectionString))
-    {
-        conn.Open();
-        using (SqlCommand cmd = new SqlCommand("INSERT INTO ErrorLog (ErrorMessage, LogDate) VALUES (@msg, GETDATE())", conn))
-        {
-            cmd.Parameters.AddWithValue("@msg", errorMessage);
-            cmd.ExecuteNonQuery();
-        }
-    }
 }
