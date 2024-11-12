@@ -1,0 +1,83 @@
+using System;
+using System.Data;
+using System.IO;
+using System.Text;
+using Microsoft.SqlServer.Dts.Pipeline.Wrapper;
+using Microsoft.SqlServer.Dts.Runtime.Wrapper;
+
+[Microsoft.SqlServer.Dts.Pipeline.SSISScriptComponentEntryPointAttribute]
+public class ScriptMain : UserComponent
+{
+    private int _fileCounter;
+    private int _bytesWritten;
+    private TextWriter _tw;
+    private int _headerCheck;
+
+    private TextWriter CurrentWriter
+    {
+        get
+        {
+            if (_tw == null)
+            {
+                string fileName = String.Format(this.Variables.filenameNDCCode, _fileCounter);
+                string filePath = Path.Combine(this.Variables.folderOutboundArcadia, fileName);
+                _tw = File.CreateText(filePath);
+            }
+            return _tw;
+        }
+    }
+
+    public override void PreExecute()
+    {
+        base.PreExecute();
+        _fileCounter = 1;
+        _bytesWritten = 0;
+        _tw = null;
+        _headerCheck = 0;
+    }
+
+    public override void PostExecute()
+    {
+        base.PostExecute();
+        if (_tw != null)
+        {
+            _tw.Flush();
+            _tw.Close();
+        }
+    }
+
+    public override void InputNDCCode_ProcessInputRow(InputNDCCodeBuffer Row)
+    {
+
+        string thisLine = String.Format(
+                "\"{0}\",\"{1}\",\"{2}\"",
+
+                      Row.medicationID_IsNull ? "" : Row.medicationID.ToString().Replace("\"", "'")
+                    , Row.line_IsNull ? "" : Row.line.ToString().Replace("\"", "'")
+                    , Row.ndcCode_IsNull ? "" : Row.ndcCode.Replace("\"", "'"));
+
+        //Row.CHARACTERMAXIMUMLENGTH_IsNull ? "NULL" : Row.CHARACTERMAXIMUMLENGTH.ToString());
+
+        if (_bytesWritten + thisLine.Length > this.Variables.maxFileLength)
+        {
+            _tw.Flush();
+            _tw.Close();
+            _tw = null;
+            _fileCounter += 1;
+            _bytesWritten = 0;
+            _headerCheck = 0;
+        }
+
+        if (_headerCheck == 0)
+        {
+            string tableHeader = this.Variables.headerNDCCode;
+            this.CurrentWriter.WriteLine(tableHeader);
+
+            _headerCheck = 1;
+
+        }
+
+        this.CurrentWriter.WriteLine(thisLine);
+        _bytesWritten += thisLine.Length;
+    }
+}
