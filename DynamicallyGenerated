@@ -1,19 +1,20 @@
 using System;
-using System.Collections.Generic;
 using System.Data;
 using System.IO;
 using System.Text;
 using Microsoft.SqlServer.Dts.Pipeline.Wrapper;
 using Microsoft.SqlServer.Dts.Runtime.Wrapper;
+using System.Reflection;
+using System.Collections.Generic;
 
 [Microsoft.SqlServer.Dts.Pipeline.SSISScriptComponentEntryPointAttribute]
 public class ScriptMain : UserComponent
 {
     private int _fileCounter;
     private int _bytesWritten;
-    private TextWriter _tw;
-    private bool _isHeaderWritten;
     private StringBuilder _buffer;
+    private TextWriter _tw;
+    private bool _headerWritten;
 
     private TextWriter CurrentWriter
     {
@@ -34,95 +35,72 @@ public class ScriptMain : UserComponent
         base.PreExecute();
         _fileCounter = 1;
         _bytesWritten = 0;
-        _tw = null;
-        _isHeaderWritten = false;
         _buffer = new StringBuilder();
+        _tw = null;
+        _headerWritten = false;
     }
 
     public override void PostExecute()
     {
         base.PostExecute();
-        FlushBuffer(); // Ensure any remaining data is written to file
-        _tw?.Close();
+        FlushBuffer();
+        if (_tw != null)
+        {
+            _tw.Flush();
+            _tw.Close();
+        }
     }
 
     public override void InputNDCCode_ProcessInputRow(InputNDCCodeBuffer Row)
     {
-        // If the header hasn't been written yet, write it once at the start
-        if (!_isHeaderWritten)
+        if (!_headerWritten)
         {
             WriteHeader(Row);
-            _isHeaderWritten = true;
+            _headerWritten = true;
         }
 
-        // Create the row data dynamically based on columns in the buffer
-        string rowData = FormatRow(Row);
+        // Format and write the current row
+        _buffer.AppendLine(FormatRow(Row));
+        _bytesWritten += _buffer.Length;
 
-        // Check if adding this row will exceed the max file length
-        if (_bytesWritten + rowData.Length > this.Variables.maxFileLength)
+        if (_bytesWritten >= this.Variables.maxFileLength)
         {
-            FlushBuffer(); // Write buffer to file
-            _tw.Close();
-            _tw = null;
-            _fileCounter++;
+            FlushBuffer();
+            _fileCounter += 1;
             _bytesWritten = 0;
-            _isHeaderWritten = false; // Reset header for the new file
+            _headerWritten = false; // Reset header for new file
         }
-
-        _buffer.AppendLine(rowData);
-        _bytesWritten += rowData.Length;
     }
 
     private void WriteHeader(InputNDCCodeBuffer Row)
     {
-        var headerColumns = new List<string>();
-        var bufferType = Row.GetType();
-
-        // Get all property names for the columns in the row
-        foreach (var property in bufferType.GetProperties())
+        var headers = new List<string>();
+        foreach (var prop in Row.GetType().GetProperties())
         {
-            // Only add properties that represent actual columns, skipping "_IsNull" properties
-            if (!property.Name.EndsWith("_IsNull"))
-            {
-                headerColumns.Add(property.Name);
-            }
+            if (prop.Name.EndsWith("_IsNull")) continue;
+            headers.Add(prop.Name.Replace("_IsNull", ""));
         }
-
-        string headerLine = string.Join(",", headerColumns);
-        _buffer.AppendLine(headerLine);
-        _bytesWritten += headerLine.Length;
+        _buffer.AppendLine(string.Join(",", headers));
     }
 
     private string FormatRow(InputNDCCodeBuffer Row)
     {
-        var rowValues = new List<string>();
-        var bufferType = Row.GetType();
-
-        // Iterate over each property in the buffer to get column values dynamically
-        foreach (var property in bufferType.GetProperties())
+        var values = new List<string>();
+        foreach (var prop in Row.GetType().GetProperties())
         {
-            // Skip "_IsNull" properties as they do not represent actual column data
-            if (property.Name.EndsWith("_IsNull")) continue;
-
-            // Check if the column value is null
-            var isNullProperty = bufferType.GetProperty(property.Name + "_IsNull");
-            bool isNull = (bool)(isNullProperty?.GetValue(Row) ?? true);
-
-            // If the column is null, use an empty string; otherwise, retrieve its value
-            string value = isNull ? "" : property.GetValue(Row)?.ToString().Replace("\"", "'") ?? "";
-            rowValues.Add($"\"{value}\"");
+            if (!prop.Name.EndsWith("_IsNull"))
+            {
+                var value = prop.GetValue(Row)?.ToString().Replace("\"", "'") ?? "";
+                values.Add($"\"{value}\"");
+            }
         }
-
-        // Join the values with commas and return as a single CSV-formatted row
-        return string.Join(",", rowValues);
+        return string.Join(",", values);
     }
 
     private void FlushBuffer()
     {
-        if (_buffer.Length > 0)
-        {
-            this.CurrentWriter.Write(_buffer.ToString());
-            _buffer.Clear(); // Reset the buffer
-        }
+        this.CurrentWriter.Write(_buffer.ToString());
+        _tw.Flush();
+        _buffer.Clear();
     }
 }
