@@ -3,125 +3,132 @@ using System.Data;
 using System.Data.SqlClient;
 using System.IO;
 using System.Text;
-using Microsoft.SqlServer.Dts.Pipeline.Wrapper;
-using Microsoft.SqlServer.Dts.Runtime.Wrapper;
+using Microsoft.SqlServer.Dts.Runtime;
 using System.Collections.Generic;
 
-[Microsoft.SqlServer.Dts.Pipeline.SSISScriptComponentEntryPointAttribute]
-public class ScriptMain : UserComponent
+public void Main()
 {
-    private int _fileCounter;
-    private int _bytesWritten;
-    private StringBuilder _buffer;
-    private TextWriter _tw;
-    private bool _headerWritten;
+    int fileCounter = 1;
+    int bytesWritten = 0;
+    StringBuilder buffer = new StringBuilder();
+    bool headerWritten = false;
+    TextWriter tw = null;
 
-    private TextWriter CurrentWriter
+    try
     {
-        get
+        // Retrieve SSIS variables
+        string connectionString = Dts.Variables["User::connectionString"].Value.ToString();
+        string storedProcName = Dts.Variables["User::storedProcName"].Value.ToString();
+        string folderPath = Dts.Variables["User::folderOutboundArcadia"].Value.ToString();
+        string fileNameTemplate = Dts.Variables["User::filenameNDCCode"].Value.ToString();
+        int maxFileLength = (int)Dts.Variables["User::maxFileLength"].Value;
+
+        using (SqlConnection conn = new SqlConnection(connectionString))
         {
-            if (_tw == null)
+            SqlCommand cmd = new SqlCommand(storedProcName, conn)
             {
-                string fileName = String.Format(this.Variables.filenameNDCCode, _fileCounter);
-                string filePath = Path.Combine(this.Variables.folderOutboundArcadia, fileName);
-                _tw = File.CreateText(filePath);
-            }
-            return _tw;
-        }
-    }
+                CommandType = CommandType.StoredProcedure
+            };
+            conn.Open();
 
-    public override void PreExecute()
-    {
-        base.PreExecute();
-        _fileCounter = 1;
-        _bytesWritten = 0;
-        _buffer = new StringBuilder();
-        _tw = null;
-        _headerWritten = false;
-        ExecuteStoredProc();
-    }
-
-    public override void PostExecute()
-    {
-        base.PostExecute();
-        FlushBuffer();
-        if (_tw != null)
-        {
-            _tw.Flush();
-            _tw.Close();
-        }
-    }
-
-    private void ExecuteStoredProc()
-    {
-        // Set up connection string and stored procedure
-        string connString = this.Variables.connectionString;  // SSIS variable for connection string
-        string storedProcName = this.Variables.storedProcName;  // SSIS variable for stored procedure name
-
-        using (SqlConnection conn = new SqlConnection(connString))
-        {
-            using (SqlCommand cmd = new SqlCommand(storedProcName, conn))
+            using (SqlDataReader reader = cmd.ExecuteReader())
             {
-                cmd.CommandType = CommandType.StoredProcedure;
-                
-                conn.Open();
-
-                using (SqlDataReader reader = cmd.ExecuteReader())
+                while (reader.Read())
                 {
-                    WriteDataToFile(reader);
+                    // Write header once at the beginning
+                    if (!headerWritten)
+                    {
+                        WriteHeader(reader, buffer);
+                        headerWritten = true;
+                    }
+
+                    // Write data rows
+                    buffer.AppendLine(FormatRow(reader));
+                    bytesWritten += buffer.Length;
+
+                    // Check file size and flush if it exceeds max length
+                    if (bytesWritten >= maxFileLength)
+                    {
+                        FlushBuffer(ref tw, buffer, ref fileCounter, folderPath, fileNameTemplate);
+                        bytesWritten = 0;
+                        headerWritten = false;  // Reset header for new file
+                    }
                 }
             }
-        }
-    }
 
-    private void WriteDataToFile(SqlDataReader reader)
-    {
-        while (reader.Read())
-        {
-            if (!_headerWritten)
+            // Final flush if there's remaining data in the buffer
+            if (buffer.Length > 0)
             {
-                WriteHeader(reader);
-                _headerWritten = true;
-            }
-
-            _buffer.AppendLine(FormatRow(reader));
-            _bytesWritten += _buffer.Length;
-
-            if (_bytesWritten >= this.Variables.maxFileLength)
-            {
-                FlushBuffer();
-                _fileCounter += 1;
-                _bytesWritten = 0;
-                _headerWritten = false;  // Reset header for new file
+                FlushBuffer(ref tw, buffer, ref fileCounter, folderPath, fileNameTemplate);
             }
         }
-    }
 
-    private void WriteHeader(SqlDataReader reader)
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+    catch (Exception ex)
     {
-        var headers = new List<string>();
-        for (int i = 0; i < reader.FieldCount; i++)
+        // Log error to SSIS and/or a SQL Server table
+        LogError(ex.Message, connectionString);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+    }
+    finally
+    {
+        if (tw != null)
         {
-            headers.Add(reader.GetName(i));
+            tw.Flush();
+            tw.Close();
         }
-        _buffer.AppendLine(string.Join(",", headers));
+    }
+}
+
+// Function to write header
+private void WriteHeader(SqlDataReader reader, StringBuilder buffer)
+{
+    var headers = new List<string>();
+    for (int i = 0; i < reader.FieldCount; i++)
+    {
+        headers.Add(reader.GetName(i));
+    }
+    buffer.AppendLine(string.Join(",", headers));
+}
+
+// Function to format each row
+private string FormatRow(SqlDataReader reader)
+{
+    var values = new List<string>();
+    for (int i = 0; i < reader.FieldCount; i++)
+    {
+        var value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString().Replace("\"", "'");
+        values.Add($"\"{value}\"");
+    }
+    return string.Join(",", values);
+}
+
+// Function to flush buffer to file and reset for next file
+private void FlushBuffer(ref TextWriter tw, StringBuilder buffer, ref int fileCounter, string folderPath, string fileNameTemplate)
+{
+    string fileName = string.Format(fileNameTemplate, fileCounter);
+    string filePath = Path.Combine(folderPath, fileName);
+
+    using (tw = File.CreateText(filePath))
+    {
+        tw.Write(buffer.ToString());
     }
 
-    private string FormatRow(SqlDataReader reader)
+    buffer.Clear();
+    fileCounter++;
+}
+
+// Optional error logging function to SQL Server
+private void LogError(string errorMessage, string connectionString)
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
     {
-        var values = new List<string>();
-        for (int i = 0; i < reader.FieldCount; i++)
+        conn.Open();
+        using (SqlCommand cmd = new SqlCommand("INSERT INTO ErrorLog (ErrorMessage, LogDate) VALUES (@msg, GETDATE())", conn))
         {
-            var value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString().Replace("\"", "'");
-            values.Add($"\"{value}\"");
+            cmd.Parameters.AddWithValue("@msg", errorMessage);
+            cmd.ExecuteNonQuery();
         }
-        return string.Join(",", values);
-    }
-
-    private void FlushBuffer()
-    {
-        this.CurrentWriter.Write(_buffer.ToString());
-        _tw.Flush();
-        _buffer.Clear();
     }
 }
