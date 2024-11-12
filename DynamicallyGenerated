@@ -1,0 +1,128 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.IO;
+using System.Text;
+using Microsoft.SqlServer.Dts.Pipeline.Wrapper;
+using Microsoft.SqlServer.Dts.Runtime.Wrapper;
+
+[Microsoft.SqlServer.Dts.Pipeline.SSISScriptComponentEntryPointAttribute]
+public class ScriptMain : UserComponent
+{
+    private int _fileCounter;
+    private int _bytesWritten;
+    private TextWriter _tw;
+    private bool _isHeaderWritten;
+    private StringBuilder _buffer;
+
+    private TextWriter CurrentWriter
+    {
+        get
+        {
+            if (_tw == null)
+            {
+                string fileName = String.Format(this.Variables.filenameNDCCode, _fileCounter);
+                string filePath = Path.Combine(this.Variables.folderOutboundArcadia, fileName);
+                _tw = File.CreateText(filePath);
+            }
+            return _tw;
+        }
+    }
+
+    public override void PreExecute()
+    {
+        base.PreExecute();
+        _fileCounter = 1;
+        _bytesWritten = 0;
+        _tw = null;
+        _isHeaderWritten = false;
+        _buffer = new StringBuilder();
+    }
+
+    public override void PostExecute()
+    {
+        base.PostExecute();
+        FlushBuffer(); // Ensure any remaining data is written to file
+        _tw?.Close();
+    }
+
+    public override void InputNDCCode_ProcessInputRow(InputNDCCodeBuffer Row)
+    {
+        // If the header hasn't been written yet, write it once at the start
+        if (!_isHeaderWritten)
+        {
+            WriteHeader(Row);
+            _isHeaderWritten = true;
+        }
+
+        // Create the row data dynamically based on columns in the buffer
+        string rowData = FormatRow(Row);
+
+        // Check if adding this row will exceed the max file length
+        if (_bytesWritten + rowData.Length > this.Variables.maxFileLength)
+        {
+            FlushBuffer(); // Write buffer to file
+            _tw.Close();
+            _tw = null;
+            _fileCounter++;
+            _bytesWritten = 0;
+            _isHeaderWritten = false; // Reset header for the new file
+        }
+
+        _buffer.AppendLine(rowData);
+        _bytesWritten += rowData.Length;
+    }
+
+    private void WriteHeader(InputNDCCodeBuffer Row)
+    {
+        var headerColumns = new List<string>();
+        var bufferType = Row.GetType();
+
+        // Get all property names for the columns in the row
+        foreach (var property in bufferType.GetProperties())
+        {
+            // Only add properties that represent actual columns, skipping "_IsNull" properties
+            if (!property.Name.EndsWith("_IsNull"))
+            {
+                headerColumns.Add(property.Name);
+            }
+        }
+
+        string headerLine = string.Join(",", headerColumns);
+        _buffer.AppendLine(headerLine);
+        _bytesWritten += headerLine.Length;
+    }
+
+    private string FormatRow(InputNDCCodeBuffer Row)
+    {
+        var rowValues = new List<string>();
+        var bufferType = Row.GetType();
+
+        // Iterate over each property in the buffer to get column values dynamically
+        foreach (var property in bufferType.GetProperties())
+        {
+            // Skip "_IsNull" properties as they do not represent actual column data
+            if (property.Name.EndsWith("_IsNull")) continue;
+
+            // Check if the column value is null
+            var isNullProperty = bufferType.GetProperty(property.Name + "_IsNull");
+            bool isNull = (bool)(isNullProperty?.GetValue(Row) ?? true);
+
+            // If the column is null, use an empty string; otherwise, retrieve its value
+            string value = isNull ? "" : property.GetValue(Row)?.ToString().Replace("\"", "'") ?? "";
+            rowValues.Add($"\"{value}\"");
+        }
+
+        // Join the values with commas and return as a single CSV-formatted row
+        return string.Join(",", rowValues);
+    }
+
+    private void FlushBuffer()
+    {
+        if (_buffer.Length > 0)
+        {
+            this.CurrentWriter.Write(_buffer.ToString());
+            _buffer.Clear(); // Reset the buffer
+        }
+    }
+}
