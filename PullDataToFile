@@ -12,7 +12,6 @@ public void Main()
     int bytesWritten = 0;
     StringBuilder buffer = new StringBuilder();
     bool headerWritten = false;
-    TextWriter tw = null;
 
     try
     {
@@ -44,12 +43,13 @@ public void Main()
 
                     // Write data rows
                     buffer.AppendLine(FormatRow(reader));
-                    bytesWritten += buffer.Length;
+                    bytesWritten += Encoding.UTF8.GetByteCount(buffer.ToString());
 
                     // Check file size and flush if it exceeds max length
                     if (bytesWritten >= maxFileLength)
                     {
-                        FlushBuffer(ref tw, buffer, ref fileCounter, folderPath, fileNameTemplate);
+                        FlushBuffer(buffer, fileCounter, folderPath, fileNameTemplate);
+                        fileCounter++;
                         bytesWritten = 0;
                         headerWritten = false;  // Reset header for new file
                     }
@@ -59,7 +59,7 @@ public void Main()
             // Final flush if there's remaining data in the buffer
             if (buffer.Length > 0)
             {
-                FlushBuffer(ref tw, buffer, ref fileCounter, folderPath, fileNameTemplate);
+                FlushBuffer(buffer, fileCounter, folderPath, fileNameTemplate);
             }
         }
 
@@ -67,15 +67,8 @@ public void Main()
     }
     catch (Exception ex)
     {
+        Dts.Events.FireError(0, "Script Task", $"Error: {ex.Message}", "", 0);
         Dts.TaskResult = (int)ScriptResults.Failure;
-    }
-    finally
-    {
-        if (tw != null)
-        {
-            tw.Flush();
-            tw.Close();
-        }
     }
 }
 
@@ -103,16 +96,15 @@ private string FormatRow(SqlDataReader reader)
 }
 
 // Function to flush buffer to file and reset for next file
-private void FlushBuffer(ref TextWriter tw, StringBuilder buffer, ref int fileCounter, string folderPath, string fileNameTemplate)
+private void FlushBuffer(StringBuilder buffer, int fileCounter, string folderPath, string fileNameTemplate)
 {
     string fileName = string.Format(fileNameTemplate, fileCounter);
     string filePath = Path.Combine(folderPath, fileName);
 
-    using (tw = File.CreateText(filePath))
+    using (TextWriter tw = File.CreateText(filePath))
     {
         tw.Write(buffer.ToString());
     }
 
     buffer.Clear();
-    fileCounter++;
 }
