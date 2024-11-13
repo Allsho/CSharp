@@ -16,19 +16,21 @@ public void Main()
     try
     {
         // Retrieve SSIS variables
-        string connectionString = Dts.Variables["User::connectionString"].Value.ToString();
         string storedProcName = Dts.Variables["User::storedProcName"].Value.ToString();
         string folderPath = Dts.Variables["User::folderOutboundArcadia"].Value.ToString();
         string fileNameTemplate = Dts.Variables["User::filenameNDCCode"].Value.ToString();
         int maxFileLength = (int)Dts.Variables["User::maxFileLength"].Value;
 
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        // Retrieve connection manager
+        ConnectionManager connMgr = Dts.Connections["CM_OLEDB_DB"];
+        SqlConnection conn = (SqlConnection)connMgr.AcquireConnection(Dts.Transaction);
+
+        try
         {
             SqlCommand cmd = new SqlCommand(storedProcName, conn)
             {
                 CommandType = CommandType.StoredProcedure
             };
-            conn.Open();
 
             using (SqlDataReader reader = cmd.ExecuteReader())
             {
@@ -61,6 +63,11 @@ public void Main()
             {
                 FlushBuffer(buffer, fileCounter, folderPath, fileNameTemplate);
             }
+        }
+        finally
+        {
+            // Release the connection
+            connMgr.ReleaseConnection(conn);
         }
 
         Dts.TaskResult = (int)ScriptResults.Success;
