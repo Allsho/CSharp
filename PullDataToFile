@@ -108,3 +108,7 @@ private void FlushBuffer(StringBuilder buffer, int fileCounter, string folderPat
 
     buffer.Clear();
 }
+
+
+SUBSTRING( @[User::connectionString], FINDSTRING( @[User::connectionString], "Initial Catalog=", 1) + 16, FINDSTRING( @[User::connectionString], ";", FINDSTRING( @[User::connectionString], "Initial Catalog=", 1) + 16) - (FINDSTRING( @[User::connectionString], "Initial Catalog=", 1) + 16) )
+
