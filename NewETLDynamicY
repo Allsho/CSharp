@@ -1,0 +1,136 @@
+using System;
+using System.Data;
+using System.Data.SqlClient;
+using System.IO;
+using System.Text;
+using Microsoft.SqlServer.Dts.Runtime;
+
+public void Main()
+{
+    string connString = Dts.Variables["User::connectionString"].Value.ToString();
+    string folderPath = Dts.Variables["User::folderOutbound"].Value.ToString();
+    string runSpecificProc = Dts.Variables["User::runSpecificProc"].Value.ToString();
+
+    try
+    {
+        using (SqlConnection conn = new SqlConnection(connString))
+        {
+            conn.Open();
+
+            // Fetch configuration
+            string query = @"
+                SELECT TOP 1 *
+                FROM StoredProcConfig
+                WHERE (StoredProcName = @RunSpecificProc OR @RunSpecificProc IS NULL)
+                  AND IsActive = 1
+                ORDER BY Id";
+
+            using (SqlCommand configCmd = new SqlCommand(query, conn))
+            {
+                configCmd.Parameters.AddWithValue("@RunSpecificProc", string.IsNullOrEmpty(runSpecificProc) ? (object)DBNull.Value : runSpecificProc);
+
+                using (SqlDataReader configReader = configCmd.ExecuteReader())
+                {
+                    while (configReader.Read())
+                    {
+                        string storedProcName = configReader["StoredProcName"].ToString();
+                        string fileNameTemplate = configReader["FileNameTemplate"].ToString();
+                        int maxFileLength = Convert.ToInt32(configReader["MaxFileLength"]);
+                        object dayFilter = configReader["DayFilter"] == DBNull.Value ? null : configReader["DayFilter"];
+                        object yearFilter = configReader["YearFilter"] == DBNull.Value ? null : configReader["YearFilter"];
+
+                        ExecuteAndExportStoredProc(conn, storedProcName, folderPath, fileNameTemplate, maxFileLength, dayFilter, yearFilter);
+                    }
+                }
+            }
+        }
+
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+    catch (Exception ex)
+    {
+        Dts.Events.FireError(0, "SSIS Script Task", $"Error: {ex.Message}", "", 0);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+    }
+}
+
+private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcName, string folderPath, string fileNameTemplate, int maxFileLength, object dayFilter, object yearFilter)
+{
+    int fileCounter = 1;
+    int bytesWritten = 0;
+    StringBuilder buffer = new StringBuilder();
+    bool headerWritten = false;
+
+    using (SqlCommand cmd = new SqlCommand(storedProcName, conn))
+    {
+        cmd.CommandType = CommandType.StoredProcedure;
+
+        // Add filter parameters only if they are not NULL
+        if (dayFilter != null) cmd.Parameters.AddWithValue("@DayFilter", dayFilter);
+        if (yearFilter != null) cmd.Parameters.AddWithValue("@YearFilter", yearFilter);
+
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                // Write header for the first file or when starting a new file
+                if (!headerWritten)
+                {
+                    WriteHeader(reader, buffer);
+                    headerWritten = true;
+                }
+
+                // Write data rows
+                buffer.AppendLine(FormatRow(reader));
+                bytesWritten += Encoding.UTF8.GetByteCount(buffer.ToString());
+
+                // Flush buffer if file size exceeds limit
+                if (bytesWritten >= maxFileLength)
+                {
+                    FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
+                    bytesWritten = 0;
+                    headerWritten = false;  // Reset header flag for the new file
+                }
+            }
+        }
+
+        // Final flush
+        if (buffer.Length > 0)
+        {
+            FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
+        }
+    }
+}
+
+private void WriteHeader(SqlDataReader reader, StringBuilder buffer)
+{
+    for (int i = 0; i < reader.FieldCount; i++)
+    {
+        if (i > 0) buffer.Append(",");
+        buffer.Append(reader.GetName(i));
+    }
+    buffer.AppendLine();
+}
+
+private string FormatRow(SqlDataReader reader)
+{
+    StringBuilder row = new StringBuilder();
+
+    for (int i = 0; i < reader.FieldCount; i++)
+    {
+        if (i > 0) row.Append(",");
+        string value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString().Replace("\"", "'");
+        row.Append($"\"{value}\"");
+    }
+
+    return row.ToString();
+}
+
+private void FlushBuffer(StringBuilder buffer, string folderPath, string fileNameTemplate, int fileCounter)
+{
+    string fileName = string.Format(fileNameTemplate, fileCounter);
+    string filePath = Path.Combine(folderPath, fileName);
+
+    File.WriteAllText(filePath, buffer.ToString());
+    buffer.Clear();
+}
