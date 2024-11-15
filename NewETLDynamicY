@@ -39,7 +39,19 @@ public void Main()
                         object dayFilter = configReader["DayFilter"] == DBNull.Value ? null : configReader["DayFilter"];
                         object yearFilter = configReader["YearFilter"] == DBNull.Value ? null : configReader["YearFilter"];
 
-                        ExecuteAndExportStoredProc(conn, storedProcName, folderPath, fileNameTemplate, maxFileLength, dayFilter, yearFilter);
+                        try
+                        {
+                            ExecuteAndExportStoredProc(conn, storedProcName, folderPath, fileNameTemplate, maxFileLength, dayFilter, yearFilter);
+
+                            // Log success
+                            LogExecution(conn, storedProcName, "Success", "Execution completed successfully.");
+                        }
+                        catch (Exception ex)
+                        {
+                            // Log failure
+                            LogExecution(conn, storedProcName, "Failure", ex.Message);
+                            throw; // Re-throw the exception to terminate execution
+                        }
                     }
                 }
             }
@@ -89,7 +101,7 @@ private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcNam
                 {
                     FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
                     bytesWritten = 0;
-                    headerWritten = false;  // Reset header flag for the new file
+                    headerWritten = false; // Reset header flag for the new file
                 }
             }
         }
@@ -133,4 +145,20 @@ private void FlushBuffer(StringBuilder buffer, string folderPath, string fileNam
 
     File.WriteAllText(filePath, buffer.ToString());
     buffer.Clear();
+}
+
+private void LogExecution(SqlConnection conn, string storedProcName, string status, string message)
+{
+    string logQuery = @"
+        INSERT INTO ExecutionLog (StoredProcName, ExecutionStatus, Message, LogDate)
+        VALUES (@StoredProcName, @ExecutionStatus, @Message, GETDATE())";
+
+    using (SqlCommand logCmd = new SqlCommand(logQuery, conn))
+    {
+        logCmd.Parameters.AddWithValue("@StoredProcName", storedProcName);
+        logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
+        logCmd.Parameters.AddWithValue("@Message", message);
+
+        logCmd.ExecuteNonQuery();
+    }
 }
