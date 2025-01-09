@@ -1,10 +1,10 @@
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.SqlClient;
 using System.IO;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 public class ScriptMain
@@ -15,6 +15,9 @@ public class ScriptMain
         string folderPath = Dts.Variables["User::folderOutboundYaleHealth"].Value.ToString();
         string runSpecificProc = Dts.Variables["User::runSpecificProc"].Value.ToString();
 
+        int maxConcurrentTasks = 5; // Limit concurrency to 5 tasks
+        var semaphore = new SemaphoreSlim(maxConcurrentTasks);
+
         try
         {
             using (SqlConnection conn = new SqlConnection(connString))
@@ -24,42 +27,51 @@ public class ScriptMain
                 // Load configuration data into memory
                 var configurations = LoadConfigurations(conn, runSpecificProc);
 
-                // Create tasks for each stored procedure execution
                 var tasks = new List<Task>();
-                var executionLogs = new ConcurrentBag<(string StoredProcName, string Status, string Message)>();
 
+                // Execute stored procedures based on the loaded configurations
                 foreach (var config in configurations)
                 {
-                    tasks.Add(Task.Run(() =>
+                    tasks.Add(Task.Run(async () =>
                     {
+                        await semaphore.WaitAsync();
                         try
                         {
-                            ExecuteAndExportStoredProc(
-                                conn,
-                                config.StoredProcName,
-                                folderPath,
-                                config.FileNameTemplate,
-                                config.MaxFileLength,
-                                config.DayFilter,
-                                config.YearFilter
-                            );
-                            executionLogs.Add((config.StoredProcName, "Success", "Execution completed successfully."));
+                            using (var localConn = new SqlConnection(connString))
+                            {
+                                localConn.Open();
+                                ExecuteAndExportStoredProc(
+                                    localConn,
+                                    config.StoredProcName,
+                                    folderPath,
+                                    config.FileNameTemplate,
+                                    config.MaxFileLength,
+                                    config.DayFilter,
+                                    config.YearFilter
+                                );
+
+                                // Log success
+                                LogExecution(localConn, config.StoredProcName, "Success", "Execution completed successfully.");
+                            }
                         }
                         catch (Exception ex)
                         {
-                            executionLogs.Add((config.StoredProcName, "Failure", ex.Message));
+                            // Log failure
+                            using (var localConn = new SqlConnection(connString))
+                            {
+                                localConn.Open();
+                                LogExecution(localConn, config.StoredProcName, "Failure", ex.Message);
+                            }
+                        }
+                        finally
+                        {
+                            semaphore.Release();
                         }
                     }));
                 }
 
                 // Wait for all tasks to complete
-                Task.WhenAll(tasks).Wait();
-
-                // Write logs to the database
-                foreach (var log in executionLogs)
-                {
-                    LogExecution(conn, log.StoredProcName, log.Status, log.Message);
-                }
+                Task.WaitAll(tasks.ToArray());
             }
 
             Dts.TaskResult = (int)ScriptResults.Success;
@@ -116,6 +128,7 @@ public class ScriptMain
         {
             cmd.CommandType = CommandType.StoredProcedure;
 
+            // Add filter parameters only if they are not NULL
             if (dayFilter != null) cmd.Parameters.AddWithValue("@DayFilter", dayFilter);
             if (yearFilter != null) cmd.Parameters.AddWithValue("@YearFilter", yearFilter);
 
@@ -123,29 +136,33 @@ public class ScriptMain
             {
                 while (reader.Read())
                 {
+                    // Write header for the first file or when starting a new file
                     if (!headerWritten)
                     {
                         WriteHeader(reader, buffer);
-                        int headerSize = Encoding.UTF8.GetByteCount(buffer.ToString());
-                        bytesWritten += headerSize;
+                        int headersize = Encoding.UTF8.GetByteCount(buffer.ToString());
+                        bytesWritten += headersize;
                         headerWritten = true;
                     }
 
+                    // Write data rows
                     string row = FormatRow(reader);
                     int rowSize = Encoding.UTF8.GetByteCount(row + Environment.NewLine);
                     bytesWritten += rowSize;
 
                     buffer.AppendLine(row);
 
+                    // Flush buffer if file size exceeds limit
                     if (bytesWritten >= maxFileLength)
                     {
                         FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
                         bytesWritten = 0;
-                        headerWritten = false;
+                        headerWritten = false; // Reset header flag for the new file
                     }
                 }
             }
 
+            // Final flush
             if (buffer.Length > 0)
             {
                 FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
