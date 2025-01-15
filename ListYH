@@ -1,230 +1,236 @@
-using System;
-using System.Collections.Generic;
-using System.Data;
-using System.Data.SqlClient;
-using System.IO;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-
-public class ScriptMain
+public void Main()
 {
-    public void Main()
+    string connString = Dts.Variables["User::CM_OLEDB_RAB"].Value.ToString();
+    string folderPath = Dts.Variables["User::folderOutboundYaleHealth"].Value.ToString();
+    string runSpecificProc = Dts.Variables["User::runSpecificProc"].Value.ToString();
+
+    int maxConcurrentTasks = 5; // Limit concurrency to 5 tasks
+    var semaphore = new SemaphoreSlim(maxConcurrentTasks);
+
+    try
     {
-        string connString = Dts.Variables["User::CM_OLEDB_RAB"].Value.ToString();
-        string folderPath = Dts.Variables["User::folderOutboundYaleHealth"].Value.ToString();
-        string runSpecificProc = Dts.Variables["User::runSpecificProc"].Value.ToString();
-
-        int maxConcurrentTasks = 5; // Limit concurrency to 5 tasks
-        var semaphore = new SemaphoreSlim(maxConcurrentTasks);
-
-        try
+        using (SqlConnection conn = new SqlConnection(connString))
         {
-            using (SqlConnection conn = new SqlConnection(connString))
+            conn.Open();
+
+            // Load configuration data into memory
+            var configurations = LoadConfigurations(conn, runSpecificProc);
+
+            var tasks = new List<System.Threading.Tasks.Task>();
+
+            // Execute stored procedures based on the loaded configurations
+            foreach (var config in configurations)
             {
-                conn.Open();
-
-                // Load configuration data into memory
-                var configurations = LoadConfigurations(conn, runSpecificProc);
-
-                var tasks = new List<Task>();
-
-                // Execute stored procedures based on the loaded configurations
-                foreach (var config in configurations)
+                tasks.Add(System.Threading.Tasks.Task.Run(async () =>
                 {
-                    tasks.Add(Task.Run(async () =>
+                    await semaphore.WaitAsync();
+                    try
                     {
-                        await semaphore.WaitAsync();
-                        try
+                        using (var localConn = new SqlConnection(connString))
                         {
-                            using (var localConn = new SqlConnection(connString))
-                            {
-                                localConn.Open();
-                                ExecuteAndExportStoredProc(
-                                    localConn,
-                                    config.StoredProcName,
-                                    folderPath,
-                                    config.FileNameTemplate,
-                                    config.MaxFileLength,
-                                    config.DayFilter,
-                                    config.YearFilter
-                                );
+                            localConn.Open();
+                            ExecuteAndExportStoredProc(
+                                localConn,
+                                config.StoredProcName,
+                                folderPath,
+                                config.FileNameTemplate,
+                                config.MaxFileLength,
+                                config.DayFilter,
+                                config.YearFilter
+                            );
 
-                                // Log success
-                                LogExecution(localConn, config.StoredProcName, "Success", "Execution completed successfully.");
-                            }
+                            // Log success
+                            LogExecution(localConn, config.StoredProcName, "Success", "Execution completed successfully.");
                         }
-                        catch (Exception ex)
-                        {
-                            // Log failure
-                            using (var localConn = new SqlConnection(connString))
-                            {
-                                localConn.Open();
-                                LogExecution(localConn, config.StoredProcName, "Failure", ex.Message);
-                            }
-                        }
-                        finally
-                        {
-                            semaphore.Release();
-                        }
-                    }));
-                }
-
-                // Wait for all tasks to complete
-                Task.WaitAll(tasks.ToArray());
-            }
-
-            Dts.TaskResult = (int)ScriptResults.Success;
-        }
-        catch (Exception ex)
-        {
-            Dts.Events.FireError(0, "SSIS Script Task", $"Error: {ex.Message}", "", 0);
-            Dts.TaskResult = (int)ScriptResults.Failure;
-        }
-    }
-
-    private List<StoredProcConfig> LoadConfigurations(SqlConnection conn, string runSpecificProc)
-    {
-        string query = @"
-            SELECT *
-            FROM dbo.YaleHealthETLConfig
-            WHERE (StoredProcName = @RunSpecificProc OR @RunSpecificProc IS NULL)
-              AND IsActive = 1
-            ORDER BY YHId";
-
-        var configurations = new List<StoredProcConfig>();
-
-        using (SqlCommand cmd = new SqlCommand(query, conn))
-        {
-            cmd.Parameters.AddWithValue("@RunSpecificProc", string.IsNullOrEmpty(runSpecificProc) ? (object)DBNull.Value : runSpecificProc);
-
-            using (SqlDataReader reader = cmd.ExecuteReader())
-            {
-                while (reader.Read())
-                {
-                    configurations.Add(new StoredProcConfig
-                    {
-                        StoredProcName = reader["StoredProcName"].ToString(),
-                        FileNameTemplate = reader["FileNameTemplate"].ToString(),
-                        MaxFileLength = Convert.ToInt32(reader["MaxFileLength"]),
-                        DayFilter = reader["DayFilter"] == DBNull.Value ? null : reader["DayFilter"],
-                        YearFilter = reader["YearFilter"] == DBNull.Value ? null : reader["YearFilter"]
-                    });
-                }
-            }
-        }
-
-        return configurations;
-    }
-
-    private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcName, string folderPath, string fileNameTemplate, int maxFileLength, object dayFilter, object yearFilter)
-    {
-        int fileCounter = 1;
-        int bytesWritten = 0;
-        StringBuilder buffer = new StringBuilder();
-        bool headerWritten = false;
-
-        using (SqlCommand cmd = new SqlCommand(storedProcName, conn))
-        {
-            cmd.CommandType = CommandType.StoredProcedure;
-
-            // Add filter parameters only if they are not NULL
-            if (dayFilter != null) cmd.Parameters.AddWithValue("@DayFilter", dayFilter);
-            if (yearFilter != null) cmd.Parameters.AddWithValue("@YearFilter", yearFilter);
-
-            using (SqlDataReader reader = cmd.ExecuteReader())
-            {
-                while (reader.Read())
-                {
-                    // Write header for the first file or when starting a new file
-                    if (!headerWritten)
-                    {
-                        WriteHeader(reader, buffer);
-                        int headersize = Encoding.UTF8.GetByteCount(buffer.ToString());
-                        bytesWritten += headersize;
-                        headerWritten = true;
                     }
-
-                    // Write data rows
-                    string row = FormatRow(reader);
-                    int rowSize = Encoding.UTF8.GetByteCount(row + Environment.NewLine);
-                    bytesWritten += rowSize;
-
-                    buffer.AppendLine(row);
-
-                    // Flush buffer if file size exceeds limit
-                    if (bytesWritten >= maxFileLength)
+                    catch (Exception ex)
                     {
-                        FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
-                        bytesWritten = 0;
-                        headerWritten = false; // Reset header flag for the new file
+                        // Log failure
+                        using (var localConn = new SqlConnection(connString))
+                        {
+                            localConn.Open();
+                            LogExecution(localConn, config.StoredProcName, "Failure", ex.Message);
+                        }
                     }
+                    finally
+                    {
+                        semaphore.Release();
+                    }
+                }));
+            }
+
+            // Wait for all tasks to complete
+            System.Threading.Tasks.Task.WaitAll(tasks.ToArray());
+        }
+
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+    catch (Exception ex)
+    {
+        Dts.Events.FireError(0, "SSIS Script Task", $"Error: {ex.Message}", "", 0);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+    }
+}
+
+private List<StoredProcConfig> LoadConfigurations(SqlConnection conn, string runSpecificProc)
+{
+    string query = @"
+    SELECT *
+    FROM dbo.YaleHealthETLConfig
+    WHERE (StoredProcName = @RunSpecificProc OR @RunSpecificProc IS NULL)
+      AND IsActive = 1
+    ORDER BY YHId";
+
+    var configurations = new List<StoredProcConfig>();
+
+    using (SqlCommand cmd = new SqlCommand(query, conn))
+    {
+        cmd.Parameters.AddWithValue("@RunSpecificProc", string.IsNullOrEmpty(runSpecificProc) ? (object)DBNull.Value : runSpecificProc);
+
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                configurations.Add(new StoredProcConfig
+                {
+                    StoredProcName = reader["StoredProcName"].ToString(),
+                    FileNameTemplate = reader["FileNameTemplate"].ToString(),
+                    MaxFileLength = Convert.ToInt32(reader["MaxFileLength"]),
+                    DayFilter = reader["DayFilter"] == DBNull.Value ? null : reader["DayFilter"],
+                    YearFilter = reader["YearFilter"] == DBNull.Value ? null : reader["YearFilter"]
+                });
+            }
+        }
+    }
+
+    return configurations;
+}
+
+private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcName, string folderPath, string fileNameTemplate, int maxFileLength, object dayFilter, object yearFilter)
+{
+    int fileCounter = 1;
+    int bytesWritten = 0;
+    StringBuilder buffer = new StringBuilder();
+    bool headerWritten = false;
+
+    using (SqlCommand cmd = new SqlCommand(storedProcName, conn))
+    {
+        cmd.CommandType = CommandType.StoredProcedure;
+
+        // Add filter parameters only if they are not NULL
+        if (dayFilter != null) cmd.Parameters.AddWithValue("@DayFilter", dayFilter);
+        if (yearFilter != null) cmd.Parameters.AddWithValue("@YearFilter", yearFilter);
+
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                // Write header for the first file or when starting a new file
+                if (!headerWritten)
+                {
+                    WriteHeader(reader, buffer);
+                    int headersize = Encoding.UTF8.GetByteCount(buffer.ToString());
+                    bytesWritten += headersize;
+                    headerWritten = true;
+                }
+
+                // Write data rows
+                string row = FormatRow(reader);
+                int rowSize = Encoding.UTF8.GetByteCount(row + Environment.NewLine);
+                bytesWritten += rowSize;
+
+                buffer.AppendLine(row);
+
+                // Flush buffer if file size exceeds limit
+                if (bytesWritten >= maxFileLength)
+                {
+                    FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
+                    bytesWritten = 0;
+                    headerWritten = false; // Reset header flag for the new file
                 }
             }
-
-            // Final flush
-            if (buffer.Length > 0)
-            {
-                FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
-            }
         }
-    }
 
-    private void WriteHeader(SqlDataReader reader, StringBuilder buffer)
-    {
-        for (int i = 0; i < reader.FieldCount; i++)
+        // Final flush
+        if (buffer.Length > 0)
         {
-            if (i > 0) buffer.Append(",");
-            buffer.Append(reader.GetName(i));
+            FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
         }
-        buffer.AppendLine();
     }
+}
 
-    private string FormatRow(SqlDataReader reader)
+private void WriteHeader(SqlDataReader reader, StringBuilder buffer)
+{
+    for (int i = 0; i < reader.FieldCount; i++)
     {
-        StringBuilder row = new StringBuilder();
+        if (i > 0) buffer.Append(",");
+        buffer.Append(reader.GetName(i));
+    }
+    buffer.AppendLine();
+}
 
-        for (int i = 0; i < reader.FieldCount; i++)
+private string FormatRow(SqlDataReader reader)
+{
+    StringBuilder row = new StringBuilder();
+
+    for (int i = 0; i < reader.FieldCount; i++)
+    {
+        if (i > 0) row.Append(",");
+
+        string value;
+
+        // Check the field type and format datetime fields explicitly
+        if (!reader.IsDBNull(i) && reader.GetFieldType(i) == typeof(DateTime))
         {
-            if (i > 0) row.Append(",");
-            string value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString().Replace("\"", "'");
-            row.Append($"\"{value}\"");
+            value = reader.GetDateTime(i).ToString("yyyy-MM-dd HH:mm:ss.fff"); // SQL Server format with milliseconds
         }
-
-        return row.ToString();
-    }
-
-    private void FlushBuffer(StringBuilder buffer, string folderPath, string fileNameTemplate, int fileCounter)
-    {
-        string fileName = string.Format(fileNameTemplate, fileCounter);
-        string filePath = Path.Combine(folderPath, fileName);
-
-        File.WriteAllText(filePath, buffer.ToString());
-        buffer.Clear();
-    }
-
-    private void LogExecution(SqlConnection conn, string storedProcName, string status, string message)
-    {
-        string logQuery = @"
-            INSERT INTO dbo.YaleHealthExecutionLog (StoredProcName, ExecutionStatus, Message, LogDate)
-            VALUES (@StoredProcName, @ExecutionStatus, @Message, GETDATE())";
-
-        using (SqlCommand logCmd = new SqlCommand(logQuery, conn))
+        else
         {
-            logCmd.Parameters.AddWithValue("@StoredProcName", storedProcName);
-            logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
-            logCmd.Parameters.AddWithValue("@Message", message);
-
-            logCmd.ExecuteNonQuery();
+            value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString().Replace("\"", "'");
         }
+        
+        row.Append($"\"{value}\"");
     }
 
-    public class StoredProcConfig
+    return row.ToString();
+}
+
+private void FlushBuffer(StringBuilder buffer, string folderPath, string fileNameTemplate, int fileCounter)
+{
+    string currentDate = DateTime.Now.ToString("yyyyMMdd"); // Get the current date
+
+    string fileName = fileNameTemplate
+        .Replace("{YYYYMMDD}", currentDate) // Add the date
+        .Replace("{0}", fileCounter.ToString()); // Add the file counter
+    
+    
+    string filePath = Path.Combine(folderPath, fileName);
+
+    File.WriteAllText(filePath, buffer.ToString());
+    buffer.Clear();
+}
+
+private void LogExecution(SqlConnection conn, string storedProcName, string status, string message)
+{
+    string logQuery = @"
+    INSERT INTO dbo.YaleHealthExecutionLog (StoredProcName, ExecutionStatus, Message, LogDate)
+    VALUES (@StoredProcName, @ExecutionStatus, @Message, GETDATE())";
+
+    using (SqlCommand logCmd = new SqlCommand(logQuery, conn))
     {
-        public string StoredProcName { get; set; }
-        public string FileNameTemplate { get; set; }
-        public int MaxFileLength { get; set; }
-        public object DayFilter { get; set; }
-        public object YearFilter { get; set; }
+        logCmd.Parameters.AddWithValue("@StoredProcName", storedProcName);
+        logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
+        logCmd.Parameters.AddWithValue("@Message", message);
+
+        logCmd.ExecuteNonQuery();
     }
+}
+
+public class StoredProcConfig
+{
+    public string StoredProcName { get; set; }
+    public string FileNameTemplate { get; set; }
+    public int MaxFileLength { get; set; }
+    public object DayFilter { get; set; }
+    public object YearFilter { get; set; }
 }
