@@ -251,3 +251,54 @@ public class StoredProcConfig
     public object DayFilter { get; set; }
     public object YearFilter { get; set; }
 }
+
+
+    int fileCounter = 1;
+    int bytesWritten = 0;
+    StringBuilder buffer = new StringBuilder();
+    string header = null; // Store the header separately for reuse
+
+    using (SqlCommand cmd = new SqlCommand(storedProcName, conn))
+    {
+        cmd.CommandType = CommandType.StoredProcedure;
+
+        // Add parameters with default values
+        cmd.Parameters.AddWithValue("@DayFilter", dayFilter ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@YearFilter", yearFilter ?? DBNull.Value);
+
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                // Write header once and reuse for new files
+                if (header == null)
+                {
+                    header = WriteHeader(reader); // Save header as a string
+                    buffer.AppendLine(header);
+                    bytesWritten += Encoding.UTF8.GetByteCount(header + Environment.NewLine);
+                }
+
+                // Write data rows
+                string row = FormatRow(reader);
+                int rowSize = Encoding.UTF8.GetByteCount(row + Environment.NewLine);
+                bytesWritten += rowSize;
+
+                buffer.AppendLine(row);
+
+                // Flush buffer if file size exceeds limit
+                if (bytesWritten >= maxFileLength)
+                {
+                    FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
+                    bytesWritten = Encoding.UTF8.GetByteCount(header + Environment.NewLine); // Reset bytes for header
+                    buffer.AppendLine(header); // Add header to the new buffer
+                }
+            }
+        }
+
+        // Final flush
+        if (buffer.Length > 0)
+        {
+            FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
+        }
+    }
+}
