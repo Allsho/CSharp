@@ -179,20 +179,31 @@ private string FormatRow(SqlDataReader reader)
 
         string value;
 
-        // Check the field type and format datetime fields explicitly
-        if (!reader.IsDBNull(i) && reader.GetFieldType(i) == typeof(DateTime))
-        {
-            value = reader.GetDateTime(i).ToString("yyyy-MM-dd HH:mm:ss.fff"); // SQL Server format with milliseconds
-        }
-        else
-        {
-            value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString().Replace("\"", "'");
-        }
-        
+        // Convert all values to strings, without special formatting
+        value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString();
+
+        // Espace quotes to prevent breaking CSV format
+        value = value.Replace("\"", "'");
+
+        // Wrap each value in quotes for consistency
         row.Append($"\"{value}\"");
     }
 
+
     return row.ToString();
+
+    //    // Check the field type and format datetime fields explicitly
+    //    if (!reader.IsDBNull(i) && reader.GetFieldType(i) == typeof(DateTime))
+    //    {
+    //        value = reader.GetDateTime(i).ToString("yyyy-MM-dd HH:mm:ss.fff"); // SQL Server format with milliseconds
+    //    }
+    //    else
+    //    {
+    //        value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString().Replace("\"", "'");
+    //    }
+
+    //    row.Append($"\"{value}\"");
+    //}
 }
 
 private void FlushBuffer(StringBuilder buffer, string folderPath, string fileNameTemplate, int fileCounter)
@@ -206,8 +217,14 @@ private void FlushBuffer(StringBuilder buffer, string folderPath, string fileNam
     
     string filePath = Path.Combine(folderPath, fileName);
 
-    File.WriteAllText(filePath, buffer.ToString());
-    buffer.Clear();
+    // Use a StreamWriter for buffered writing
+    using (var stream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 8192)) // 8 KB buffer
+    using (var writer = new StreamWriter(stream))
+    {
+        writer.Write(buffer); // Write directly frrom StringBuilder
+    }
+
+    buffer.Clear(); // Clear the StringBuilder for reuse
 }
 
 private void LogExecution(SqlConnection conn, string storedProcName, string status, string message)
