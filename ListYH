@@ -1,3 +1,12 @@
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.IO;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
 public void Main()
 {
     string connString = Dts.Variables["User::CM_OLEDB_RADB"].Value.ToString();
@@ -5,94 +14,88 @@ public void Main()
     string runSpecificProc = Dts.Variables["User::runSpecificProc"].Value.ToString();
 
     const int maxConcurrentTasks = 5;
-    var semaphore = new SemaphoreSlim(maxConcurrentTasks);
+    using var semaphore = new SemaphoreSlim(maxConcurrentTasks);
 
     try
     {
-        using (var conn = new SqlConnection(connString))
+        using var conn = CreateConnection(connString);
+        var configurations = LoadConfigurations(conn, runSpecificProc);
+        var tasks = new List<Task>();
+
+        foreach (var config in configurations)
         {
-            conn.Open();
-            var configurations = LoadConfigurations(conn, runSpecificProc);
-            var tasks = new List<Task>();
-
-            foreach (var config in configurations)
-            {
-                tasks.Add(Task.Run(async () =>
-                {
-                    await semaphore.WaitAsync();
-                    try
-                    {
-                        using (var localConn = new SqlConnection(connString))
-                        {
-                            localConn.Open();
-                            ExecuteAndExportStoredProc(
-                                localConn,
-                                config.StoredProcName,
-                                folderPath,
-                                config.FileNameTemplate,
-                                config.MaxFileLength,
-                                config.DayFilter,
-                                config.YearFilter);
-
-                            LogExecution(localConn, config.StoredProcName, "Success", "Execution completed successfully.");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        using (var localConn = new SqlConnection(connString))
-                        {
-                            localConn.Open();
-                            LogExecution(localConn, config.StoredProcName, "Failure", ex.Message);
-                        }
-                    }
-                    finally
-                    {
-                        semaphore.Release();
-                    }
-                }));
-            }
-
-            Task.WaitAll(tasks.ToArray());
+            tasks.Add(RunTaskAsync(semaphore, connString, config, folderPath));
         }
 
+        Task.WaitAll(tasks.ToArray());
         Dts.TaskResult = (int)ScriptResults.Success;
     }
     catch (Exception ex)
     {
-        Dts.Events.FireError(0, "SSIS Script Task", $"Error: {ex.Message}", "", 0);
+        Dts.Events.FireError(0, "SSIS Script Task", $"Critical error: {ex.Message}", string.Empty, 0);
         Dts.TaskResult = (int)ScriptResults.Failure;
     }
 }
 
+private async Task RunTaskAsync(SemaphoreSlim semaphore, string connString, StoredProcConfig config, string folderPath)
+{
+    await semaphore.WaitAsync();
+    try
+    {
+        using var conn = CreateConnection(connString);
+        ExecuteAndExportStoredProc(
+            conn,
+            config.StoredProcName,
+            folderPath,
+            config.FileNameTemplate,
+            config.MaxFileLength,
+            config.DayFilter,
+            config.YearFilter);
+
+        LogExecution(conn, config.StoredProcName, "Success", "Execution completed successfully.");
+    }
+    catch (Exception ex)
+    {
+        using var conn = CreateConnection(connString);
+        LogExecution(conn, config.StoredProcName, "Failure", ex.Message);
+    }
+    finally
+    {
+        semaphore.Release();
+    }
+}
+
+private SqlConnection CreateConnection(string connString)
+{
+    var conn = new SqlConnection(connString);
+    conn.Open();
+    return conn;
+}
+
 private List<StoredProcConfig> LoadConfigurations(SqlConnection conn, string runSpecificProc)
 {
-    const string query = @"SELECT * FROM dbo.YaleHealthETLConfig
-                           WHERE (StoredProcName = @RunSpecificProc OR @RunSpecificProc IS NULL)
-                             AND IsActive = 1
-                           ORDER BY YHId";
+    const string query = @"
+        SELECT * FROM dbo.YaleHealthETLConfig
+        WHERE (StoredProcName = @RunSpecificProc OR @RunSpecificProc IS NULL)
+          AND IsActive = 1
+        ORDER BY YHId";
 
     var configurations = new List<StoredProcConfig>();
+    using var cmd = new SqlCommand(query, conn);
+    cmd.Parameters.AddWithValue("@RunSpecificProc", string.IsNullOrEmpty(runSpecificProc) ? DBNull.Value : runSpecificProc);
 
-    using (var cmd = new SqlCommand(query, conn))
+    using var reader = cmd.ExecuteReader();
+    while (reader.Read())
     {
-        cmd.Parameters.AddWithValue("@RunSpecificProc", string.IsNullOrEmpty(runSpecificProc) ? (object)DBNull.Value : runSpecificProc);
-
-        using (var reader = cmd.ExecuteReader())
+        configurations.Add(new StoredProcConfig
         {
-            while (reader.Read())
-            {
-                configurations.Add(new StoredProcConfig
-                {
-                    StoredProcName = reader["StoredProcName"].ToString(),
-                    FileNameTemplate = reader["FileNameTemplate"].ToString(),
-                    MaxFileLength = Convert.ToInt32(reader["MaxFileLength"]),
-                    DayFilter = reader["DayFilter"] == DBNull.Value ? null : reader["DayFilter"],
-                    YearFilter = reader["YearFilter"] == DBNull.Value ? null : reader["YearFilter"]
-                });
-            }
-        }
+            StoredProcName = reader["StoredProcName"].ToString(),
+            FileNameTemplate = reader["FileNameTemplate"].ToString(),
+            MaxFileLength = Convert.ToInt32(reader["MaxFileLength"]),
+            DayFilter = reader["DayFilter"] == DBNull.Value ? null : reader["DayFilter"],
+            YearFilter = reader["YearFilter"] == DBNull.Value ? null : reader["YearFilter"]
+        });
     }
-
     return configurations;
 }
 
@@ -100,44 +103,41 @@ private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcNam
 {
     int fileCounter = 1;
     int bytesWritten = 0;
-    var buffer = new StringBuilder();
+    var buffer = new StringBuilder(8192);
     bool headerWritten = false;
 
-    using (var cmd = new SqlCommand(storedProcName, conn))
+    using var cmd = new SqlCommand(storedProcName, conn)
     {
-        cmd.CommandType = CommandType.StoredProcedure;
+        CommandType = CommandType.StoredProcedure
+    };
+    if (dayFilter != null) cmd.Parameters.AddWithValue("@DayFilter", dayFilter);
+    if (yearFilter != null) cmd.Parameters.AddWithValue("@YearFilter", yearFilter);
 
-        if (dayFilter != null) cmd.Parameters.AddWithValue("@DayFilter", dayFilter);
-        if (yearFilter != null) cmd.Parameters.AddWithValue("@YearFilter", yearFilter);
-
-        using (var reader = cmd.ExecuteReader())
+    using var reader = cmd.ExecuteReader();
+    while (reader.Read())
+    {
+        if (!headerWritten)
         {
-            while (reader.Read())
-            {
-                if (!headerWritten)
-                {
-                    WriteHeader(reader, buffer);
-                    bytesWritten += Encoding.UTF8.GetByteCount(buffer.ToString());
-                    headerWritten = true;
-                }
-
-                string row = FormatRow(reader);
-                bytesWritten += Encoding.UTF8.GetByteCount(row + Environment.NewLine);
-                buffer.AppendLine(row);
-
-                if (bytesWritten >= maxFileLength)
-                {
-                    FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
-                    bytesWritten = 0;
-                    headerWritten = false;
-                }
-            }
+            WriteHeader(reader, buffer);
+            bytesWritten += Encoding.UTF8.GetByteCount(buffer.ToString());
+            headerWritten = true;
         }
 
-        if (buffer.Length > 0)
+        string row = FormatRow(reader);
+        bytesWritten += Encoding.UTF8.GetByteCount(row + Environment.NewLine);
+        buffer.AppendLine(row);
+
+        if (bytesWritten >= maxFileLength)
         {
-            FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
+            FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
+            bytesWritten = 0;
+            headerWritten = false;
         }
+    }
+
+    if (buffer.Length > 0)
+    {
+        FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
     }
 }
 
@@ -154,16 +154,12 @@ private void WriteHeader(SqlDataReader reader, StringBuilder buffer)
 private string FormatRow(SqlDataReader reader)
 {
     var row = new StringBuilder();
-
     for (int i = 0; i < reader.FieldCount; i++)
     {
         if (i > 0) row.Append(",");
-
-        string value = reader.IsDBNull(i) ? "" : reader.GetValue(i).ToString();
-        value = value.Replace("\"", "'");
+        string value = reader.IsDBNull(i) ? string.Empty : reader.GetValue(i).ToString().Replace("\"", "'");
         row.Append($"\"{value}\"");
     }
-
     return row.ToString();
 }
 
@@ -174,28 +170,23 @@ private void FlushBuffer(StringBuilder buffer, string folderPath, string fileNam
         .Replace("{0}", fileCounter.ToString());
 
     string filePath = Path.Combine(folderPath, fileName);
-
-    using (var writer = new StreamWriter(filePath, false, Encoding.UTF8, 8192))
-    {
-        writer.Write(buffer);
-    }
-
+    using var writer = new StreamWriter(filePath, false, Encoding.UTF8, 8192);
+    writer.Write(buffer);
     buffer.Clear();
 }
 
 private void LogExecution(SqlConnection conn, string storedProcName, string status, string message)
 {
-    const string logQuery = @"INSERT INTO dbo.YaleHealthExecutionLog (StoredProcName, ExecutionStatus, Message, LogDate)
-                              VALUES (@StoredProcName, @ExecutionStatus, @Message, GETDATE())";
+    const string logQuery = @"
+        INSERT INTO dbo.YaleHealthExecutionLog 
+        (StoredProcName, ExecutionStatus, Message, LogDate)
+        VALUES (@StoredProcName, @ExecutionStatus, @Message, GETDATE())";
 
-    using (var logCmd = new SqlCommand(logQuery, conn))
-    {
-        logCmd.Parameters.AddWithValue("@StoredProcName", storedProcName);
-        logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
-        logCmd.Parameters.AddWithValue("@Message", message);
-
-        logCmd.ExecuteNonQuery();
-    }
+    using var logCmd = new SqlCommand(logQuery, conn);
+    logCmd.Parameters.AddWithValue("@StoredProcName", storedProcName);
+    logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
+    logCmd.Parameters.AddWithValue("@Message", message);
+    logCmd.ExecuteNonQuery();
 }
 
 public class StoredProcConfig
