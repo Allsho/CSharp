@@ -1,68 +1,68 @@
-using System;
-using System.Collections.Generic;
-using System.Data;
-using System.Data.SqlClient;
-using System.IO;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-
 public void Main()
 {
-    string connString = Dts.Variables["User::CM_OLEDB_RADB"].Value.ToString();
+    string connString = Dts.Variables["User::CM_OLEDB_RAB"].Value.ToString();
     string folderPath = Dts.Variables["User::folderOutboundYaleHealth"].Value.ToString();
     string runSpecificProc = Dts.Variables["User::runSpecificProc"].Value.ToString();
 
     const int maxConcurrentTasks = 5;
-    using var semaphore = new SemaphoreSlim(maxConcurrentTasks);
-
-    try
+    using (var semaphore = new SemaphoreSlim(maxConcurrentTasks))
     {
-        using var conn = CreateConnection(connString);
-        var configurations = LoadConfigurations(conn, runSpecificProc);
-        var tasks = new List<Task>();
 
-        foreach (var config in configurations)
+        try
         {
-            tasks.Add(RunTaskAsync(semaphore, connString, config, folderPath));
-        }
+            using (var conn = CreateConnection(connString))
+            {
+                var configurations = LoadConfigurations(conn, runSpecificProc);
+                var tasks = new List<System.Threading.Tasks.Task>();
 
-        Task.WaitAll(tasks.ToArray());
-        Dts.TaskResult = (int)ScriptResults.Success;
-    }
-    catch (Exception ex)
-    {
-        Dts.Events.FireError(0, "SSIS Script Task", $"Critical error: {ex.Message}", string.Empty, 0);
-        Dts.TaskResult = (int)ScriptResults.Failure;
+                foreach (var config in configurations)
+                {
+                    tasks.Add(RunTaskAsync(semaphore, connString, config, folderPath));
+                }
+
+                System.Threading.Tasks.Task.WaitAll(tasks.ToArray());
+                Dts.TaskResult = (int)ScriptResults.Success;
+            }
+        }
+        catch (Exception ex)
+        {
+            Dts.Events.FireError(0, "SSIS Script Task", $"Critical error: {ex.Message}", string.Empty, 0);
+            Dts.TaskResult = (int)ScriptResults.Failure;
+        }
     }
 }
 
-private async Task RunTaskAsync(SemaphoreSlim semaphore, string connString, StoredProcConfig config, string folderPath)
+private async System.Threading.Tasks.Task RunTaskAsync(SemaphoreSlim semaphore, string connString, StoredProcConfig config, string folderPath)
 {
     await semaphore.WaitAsync();
     try
     {
-        using var conn = CreateConnection(connString);
-        ExecuteAndExportStoredProc(
-            conn,
-            config.StoredProcName,
-            folderPath,
-            config.FileNameTemplate,
-            config.MaxFileLength,
-            config.DayFilter,
-            config.YearFilter);
+        using (var conn = CreateConnection(connString))
+        {
+            ExecuteAndExportStoredProc(
+                conn,
+                config.StoredProcName,
+                folderPath,
+                config.FileNameTemplate,
+                config.MaxFileLength,
+                config.DayFilter,
+                config.YearFilter);
 
-        LogExecution(conn, config.StoredProcName, "Success", "Execution completed successfully.");
+            LogExecution(conn, config.StoredProcName, "Success", "Execution completed successfully.");
+        }
     }
     catch (Exception ex)
     {
-        using var conn = CreateConnection(connString);
-        LogExecution(conn, config.StoredProcName, "Failure", ex.Message);
+        using (var conn = CreateConnection(connString))
+        {
+            LogExecution(conn, config.StoredProcName, "Failure", ex.Message);
+        }
     }
     finally
     {
         semaphore.Release();
     }
+
 }
 
 private SqlConnection CreateConnection(string connString)
@@ -81,20 +81,24 @@ private List<StoredProcConfig> LoadConfigurations(SqlConnection conn, string run
         ORDER BY YHId";
 
     var configurations = new List<StoredProcConfig>();
-    using var cmd = new SqlCommand(query, conn);
-    cmd.Parameters.AddWithValue("@RunSpecificProc", string.IsNullOrEmpty(runSpecificProc) ? DBNull.Value : runSpecificProc);
-
-    using var reader = cmd.ExecuteReader();
-    while (reader.Read())
+    using (var cmd = new SqlCommand(query, conn))
     {
-        configurations.Add(new StoredProcConfig
+        cmd.Parameters.AddWithValue("@RunSpecificProc", string.IsNullOrEmpty(runSpecificProc) ? (object)DBNull.Value : runSpecificProc);
+
+        using (var reader = cmd.ExecuteReader())
         {
-            StoredProcName = reader["StoredProcName"].ToString(),
-            FileNameTemplate = reader["FileNameTemplate"].ToString(),
-            MaxFileLength = Convert.ToInt32(reader["MaxFileLength"]),
-            DayFilter = reader["DayFilter"] == DBNull.Value ? null : reader["DayFilter"],
-            YearFilter = reader["YearFilter"] == DBNull.Value ? null : reader["YearFilter"]
-        });
+            while (reader.Read())
+            {
+                configurations.Add(new StoredProcConfig
+                {
+                    StoredProcName = reader["StoredProcName"].ToString(),
+                    FileNameTemplate = reader["FileNameTemplate"].ToString(),
+                    MaxFileLength = Convert.ToInt32(reader["MaxFileLength"]),
+                    DayFilter = reader["DayFilter"] == DBNull.Value ? null : reader["DayFilter"],
+                    YearFilter = reader["YearFilter"] == DBNull.Value ? null : reader["YearFilter"]
+                });
+            }
+        }
     }
     return configurations;
 }
@@ -106,38 +110,40 @@ private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcNam
     var buffer = new StringBuilder(8192);
     bool headerWritten = false;
 
-    using var cmd = new SqlCommand(storedProcName, conn)
+    using (var cmd = new SqlCommand(storedProcName, conn))
     {
-        CommandType = CommandType.StoredProcedure
-    };
-    if (dayFilter != null) cmd.Parameters.AddWithValue("@DayFilter", dayFilter);
-    if (yearFilter != null) cmd.Parameters.AddWithValue("@YearFilter", yearFilter);
+        cmd.CommandType = CommandType.StoredProcedure;
+        if (dayFilter != null) cmd.Parameters.AddWithValue("@DayFilter", dayFilter);
+        if (yearFilter != null) cmd.Parameters.AddWithValue("@YearFilter", yearFilter);
 
-    using var reader = cmd.ExecuteReader();
-    while (reader.Read())
-    {
-        if (!headerWritten)
+        using (var reader = cmd.ExecuteReader())
         {
-            WriteHeader(reader, buffer);
-            bytesWritten += Encoding.UTF8.GetByteCount(buffer.ToString());
-            headerWritten = true;
+            while (reader.Read())
+            {
+                if (!headerWritten)
+                {
+                    WriteHeader(reader, buffer);
+                    bytesWritten += Encoding.UTF8.GetByteCount(buffer.ToString());
+                    headerWritten = true;
+                }
+
+                string row = FormatRow(reader);
+                bytesWritten += Encoding.UTF8.GetByteCount(row + Environment.NewLine);
+                buffer.AppendLine(row);
+
+                if (bytesWritten >= maxFileLength)
+                {
+                    FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
+                    bytesWritten = 0;
+                    headerWritten = false;
+                }
+            }
+
+            if (buffer.Length > 0)
+            {
+                FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
+            }
         }
-
-        string row = FormatRow(reader);
-        bytesWritten += Encoding.UTF8.GetByteCount(row + Environment.NewLine);
-        buffer.AppendLine(row);
-
-        if (bytesWritten >= maxFileLength)
-        {
-            FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
-            bytesWritten = 0;
-            headerWritten = false;
-        }
-    }
-
-    if (buffer.Length > 0)
-    {
-        FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
     }
 }
 
@@ -145,7 +151,7 @@ private void WriteHeader(SqlDataReader reader, StringBuilder buffer)
 {
     for (int i = 0; i < reader.FieldCount; i++)
     {
-        if (i > 0) buffer.Append(",");
+        if (i > 0) buffer.Append("|");
         buffer.Append(reader.GetName(i));
     }
     buffer.AppendLine();
@@ -156,7 +162,7 @@ private string FormatRow(SqlDataReader reader)
     var row = new StringBuilder();
     for (int i = 0; i < reader.FieldCount; i++)
     {
-        if (i > 0) row.Append(",");
+        if (i > 0) row.Append("|");
         string value = reader.IsDBNull(i) ? string.Empty : reader.GetValue(i).ToString().Replace("\"", "'");
         row.Append($"\"{value}\"");
     }
@@ -170,9 +176,11 @@ private void FlushBuffer(StringBuilder buffer, string folderPath, string fileNam
         .Replace("{0}", fileCounter.ToString());
 
     string filePath = Path.Combine(folderPath, fileName);
-    using var writer = new StreamWriter(filePath, false, Encoding.UTF8, 8192);
-    writer.Write(buffer);
-    buffer.Clear();
+    using (var writer = new StreamWriter(filePath, false, Encoding.UTF8, 8192))
+    {
+        writer.Write(buffer);
+        buffer.Clear();
+    }
 }
 
 private void LogExecution(SqlConnection conn, string storedProcName, string status, string message)
@@ -182,11 +190,13 @@ private void LogExecution(SqlConnection conn, string storedProcName, string stat
         (StoredProcName, ExecutionStatus, Message, LogDate)
         VALUES (@StoredProcName, @ExecutionStatus, @Message, GETDATE())";
 
-    using var logCmd = new SqlCommand(logQuery, conn);
-    logCmd.Parameters.AddWithValue("@StoredProcName", storedProcName);
-    logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
-    logCmd.Parameters.AddWithValue("@Message", message);
-    logCmd.ExecuteNonQuery();
+    using (var logCmd = new SqlCommand(logQuery, conn))
+    {
+        logCmd.Parameters.AddWithValue("@StoredProcName", storedProcName);
+        logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
+        logCmd.Parameters.AddWithValue("@Message", message);
+        logCmd.ExecuteNonQuery();
+    }
 }
 
 public class StoredProcConfig
