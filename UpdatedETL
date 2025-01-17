@@ -1,0 +1,241 @@
+        public void Main()
+        {
+            string connString = Dts.Variables["User::CM_OLEDB_RADB"].Value.ToString();
+            string folderPath = Dts.Variables["User::folderOutboundYaleHealth"].Value.ToString();
+            string runSpecificProc = Dts.Variables["User::runSpecificProc"].Value.ToString();
+
+            const int maxConcurrentTasks = 5;
+            using (var semaphore = new SemaphoreSlim(maxConcurrentTasks))
+            {
+
+                try
+                {
+                    using (var conn = CreateConnection(connString))
+                    {
+                        var configurations = LoadConfigurations(conn, runSpecificProc);
+                        var tasks = new List<System.Threading.Tasks.Task>();
+
+                        foreach (var config in configurations)
+                        {
+                            tasks.Add(RunTaskAsync(semaphore, connString, config, folderPath));
+                        }
+
+                        System.Threading.Tasks.Task.WaitAll(tasks.ToArray());
+                        Dts.TaskResult = (int)ScriptResults.Success;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Dts.Events.FireError(0, "SSIS Script Task", $"Critical error: {ex.Message}\nStackTrace: {ex.StackTrace}", string.Empty, 0);
+                    Dts.TaskResult = (int)ScriptResults.Failure;
+                }
+            }
+        }
+
+        private async System.Threading.Tasks.Task RunTaskAsync(SemaphoreSlim semaphore, string connString, StoredProcConfig config, string folderPath)
+        {
+            await semaphore.WaitAsync();
+            try
+            {
+                using (var conn = CreateConnection(connString))
+                {
+                    ExecuteAndExportStoredProc(
+                        conn,
+                        config.StoredProcName,
+                        folderPath,
+                        config.FileNameTemplate,
+                        config.MaxFileLength);
+                        //config.DayFilter, NOT IN USE
+                        //config.YearFilter); NOT IN USE
+
+                    LogExecution(conn, config.StoredProcName, "Success", "Execution completed successfully.", "Success");
+                }
+            }
+            catch (Exception ex)
+            {
+                using (var conn = CreateConnection(connString))
+                {
+                    LogExecution(conn, config.StoredProcName, "Failure", ex.Message, ex.StackTrace);
+                }
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+
+        }
+
+        private SqlConnection CreateConnection(string connString)
+        {
+            var conn = new SqlConnection(connString);
+            conn.Open();
+            return conn;
+        }
+
+        private List<StoredProcConfig> LoadConfigurations(SqlConnection conn, string runSpecificProc)
+        {
+            const string query = @"
+                   SELECT 
+		                 ObjectName
+                       , EtlProcessStep
+                       , EtlProcessingOrder
+                       , EtlOutputFileName
+                       , StoredProcedureName
+                       , StoredProcedureExecuteStatement
+	                   , IsCritical
+	                   , MaxFileSize
+                   FROM YHP.YaleHealth_ETL_Objects
+                   WHERE
+                       [StoredProcedureExecuteStatement] IS NOT NULL
+                   ORDER BY
+                       EtlProcessingOrder;";
+
+            var configurations = new List<StoredProcConfig>();
+            using (var cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@RunSpecificProc", string.IsNullOrEmpty(runSpecificProc) ? (object)DBNull.Value : runSpecificProc);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        configurations.Add(new StoredProcConfig
+                        {
+                            StoredProcName = reader["StoredProcedureExecuteStatement"].ToString(),
+                            FileNameTemplate = reader["EtlOutputFileName"].ToString(),
+                            MaxFileLength = Convert.ToInt32(reader["MaxFileSize"]),
+                            //DayFilter = reader["DayFilter"] == DBNull.Value ? null : reader["DayFilter"], NOT IN USE
+                            //YearFilter = reader["YearFilter"] == DBNull.Value ? null : reader["YearFilter"] NOT IN USE
+                        });
+                    }
+                }
+            }
+            return configurations;
+        }
+
+        private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcName, string folderPath, 
+                                                    string fileNameTemplate, int maxFileLength)  //object dayFilter, object yearFilter NOT IN USE
+        {
+            int fileCounter = 1;
+            int bytesWritten = 0;
+            var buffer = new StringBuilder(8192);
+            bool headerWritten = false;
+
+            try
+            {
+
+                using (var cmd = new SqlCommand(storedProcName, conn))
+                {
+                    // Not in use
+                    //cmd.CommandType = CommandType.StoredProcedure;
+                    //if (dayFilter != null) cmd.Parameters.AddWithValue("@DayFilter", dayFilter); NOT IN USE
+                    //if (yearFilter != null) cmd.Parameters.AddWithValue("@YearFilter", yearFilter); NOT IN USE
+
+                    cmd.CommandType = CommandType.Text; // Use Text since we're passing a direct execution statements 
+
+                    // Set all parameters to NULL
+                    cmd.Parameters.AddWithValue("@DateStarting", DBNull.Value);
+                    cmd.Parameters.AddWithValue("@DateEnding", DBNull.Value);
+                    cmd.Parameters.AddWithValue("@CustomParameter1", DBNull.Value);
+                    cmd.Parameters.AddWithValue("@CustomParameter2", DBNull.Value);
+                    cmd.Parameters.AddWithValue("@DEBUG_FLAG", DBNull.Value);
+                    cmd.Parameters.Add(new SqlParameter("@log_ID", SqlDbType.Int) { Direction = ParameterDirection.Output });
+
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            if (!headerWritten)
+                            {
+                                WriteHeader(reader, buffer);
+                                bytesWritten += Encoding.UTF8.GetByteCount(buffer.ToString());
+                                headerWritten = true;
+                            }
+
+                            string row = FormatRow(reader);
+                            bytesWritten += Encoding.UTF8.GetByteCount(row + Environment.NewLine);
+                            buffer.AppendLine(row);
+
+                            if (bytesWritten >= maxFileLength)
+                            {
+                                FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
+                                bytesWritten = 0;
+                                headerWritten = false;
+                            }
+                        }
+
+                        if (buffer.Length > 0)
+                        {
+                            FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogExecution(conn, storedProcName, "Failure", ex.Message, ex.StackTrace);
+                throw;
+            }
+        }
+
+        private void WriteHeader(SqlDataReader reader, StringBuilder buffer)
+        {
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
+                if (i > 0) buffer.Append("|");
+                buffer.Append(reader.GetName(i));
+            }
+            buffer.AppendLine();
+        }
+
+        private string FormatRow(SqlDataReader reader)
+        {
+            var row = new StringBuilder();
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
+                if (i > 0) row.Append("|");
+                string value = reader.IsDBNull(i) ? string.Empty : reader.GetValue(i).ToString().Replace("\"", "'");
+                row.Append($"\"{value}\"");
+            }
+            return row.ToString();
+        }
+
+        private void FlushBuffer(StringBuilder buffer, string folderPath, string fileNameTemplate, int fileCounter)
+        {
+            string fileName = fileNameTemplate
+                .Replace("{YYYYMMDD}", DateTime.Now.ToString("yyyyMMdd"))
+                .Replace("{0}", fileCounter.ToString());
+
+            string filePath = Path.Combine(folderPath, fileName);
+            using (var writer = new StreamWriter(filePath, false, Encoding.UTF8, 8192))
+            {
+                writer.Write(buffer);
+                buffer.Clear();
+            }
+        }
+
+        private void LogExecution(SqlConnection conn, string storedProcName, string status, string message, string stackTrace)
+        {
+            const string logQuery = @"
+                INSERT INTO dbo.YaleHealthExecutionLog 
+                (StoredProcName, ExecutionStatus, Message, StackTrace, LogDate)
+                VALUES (@StoredProcName, @ExecutionStatus, @Message, @StackTrace, GETDATE())";
+
+            using (var logCmd = new SqlCommand(logQuery, conn))
+            {
+                logCmd.Parameters.AddWithValue("@StoredProcName", storedProcName);
+                logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
+                logCmd.Parameters.AddWithValue("@Message", message);
+                logCmd.Parameters.AddWithValue("@StackTrace", (object)stackTrace ?? DBNull.Value);
+                logCmd.ExecuteNonQuery();
+            }
+        }
+
+        public class StoredProcConfig
+        {
+            public string StoredProcName { get; set; }
+            public string FileNameTemplate { get; set; }
+            public int MaxFileLength { get; set; }
+            //public object DayFilter { get; set; } NOT IN USE
+            //public object YearFilter { get; set; } NOT IN USE
+        }
