@@ -1,4 +1,4 @@
-        public void Main()
+public void Main()
         {
             string connString = Dts.Variables["User::CM_OLEDB_RAB"].Value.ToString();
             string folderPath = Dts.Variables["User::folderOutboundYaleHealth"].Value.ToString();
@@ -54,14 +54,14 @@
                         folderPath,
                         config.FileNameTemplate,
                         config.MaxFileLength);
-                    LogExecution(conn, config.StoredProcName, "Success", "Execution completed successfully.", "Success");
+                    LogExecution(conn, config.StoredProcName, "Success", "Execution completed successfully.");
                 }
             }
             catch (Exception ex)
             {
                 using (var conn = CreateConnection(connString))
                 {
-                    LogExecution(conn, config.StoredProcName, "Failure", ex.Message, ex.StackTrace);
+                    LogExecution(conn, config.StoredProcName, "Failure", ex.Message);
                 }
             }
         }
@@ -79,14 +79,14 @@
                         folderPath,
                         config.FileNameTemplate,
                         config.MaxFileLength);
-                    LogExecution(conn, config.StoredProcName, "Success", "Execution completed successfully.", "Success");
+                    LogExecution(conn, config.StoredProcName, "Success", "Execution completed successfully.");
                 }
             }
             catch (Exception ex)
             {
                 using (var conn = CreateConnection(connString))
                 {
-                    LogExecution(conn, config.StoredProcName, "Failure", ex.Message, ex.StackTrace);
+                    LogExecution(conn, config.StoredProcName, "Failure", ex.Message);
                 }
             }
             finally
@@ -168,6 +168,9 @@
 
                     Console.WriteLine($"Executing stored procedure: {storedProcName}");
 
+                    // Start the stopwatch to measure write time
+                    Stopwatch stopwatch = Stopwatch.StartNew();
+
                     using (var reader = cmd.ExecuteReader())
                     {
                         while (reader.Read())
@@ -197,13 +200,17 @@
                         }
                     }
 
+                    // Stop the stopwatch and log the duration
+                    stopwatch.Stop();
+                    TimeSpan duration = stopwatch.Elapsed;
+
                     // Log successful execution
-                    LogExecution(conn, storedProcName, "Success", "Success");
+                    LogExecution(conn, storedProcName, "Success", "Success", bytesWritten, fileCounter, stopwatch.ElapsedMilliseconds);
                 }
             }
             catch (Exception ex)
             {
-                LogExecution(conn, storedProcName, "Failure", ex.Message, ex.StackTrace);
+                LogExecution(conn, storedProcName, "Failure", ex.Message, bytesWritten, fileCounter, 0, ex.StackTrace);
                 throw;
             }
         }
@@ -237,19 +244,22 @@
                 .Replace("{0}", fileCounter.ToString());
 
             string filePath = Path.Combine(folderPath, fileName);
+
             using (var writer = new StreamWriter(filePath, false, Encoding.UTF8, 8192))
             {
                 writer.Write(buffer);
                 buffer.Clear();
             }
+
         }
 
-        private void LogExecution(SqlConnection conn, string storedProcName, string status, string message, string stackTrace = null)
+        private void LogExecution(SqlConnection conn, string storedProcName, string status, string message, 
+                                                int bytesWritten = 0, int fileCounter = 0, double? writeDuration = null, string stackTrace = null)
         {
             const string logQuery = @"
                 INSERT INTO dbo.YaleHealthExecutionLog 
-                (StoredProcName, ExecutionStatus, Message, StackTrace, LogDate)
-                VALUES (@StoredProcName, @ExecutionStatus, @Message, @StackTrace, GETDATE())";
+                (StoredProcName, ExecutionStatus, Message, StackTrace, BytesWritten, FileCounter, WriteDurationMilliseconds, LogDate)
+                VALUES (@StoredProcName, @ExecutionStatus, @Message, @StackTrace, @BytesWritten, @FileCounter, @WriteDuration, GETDATE())";
 
             using (var logCmd = new SqlCommand(logQuery, conn))
             {
@@ -257,6 +267,9 @@
                 logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
                 logCmd.Parameters.AddWithValue("@Message", message);
                 logCmd.Parameters.AddWithValue("@StackTrace", (object)stackTrace ?? DBNull.Value);
+                logCmd.Parameters.AddWithValue("@BytesWritten", bytesWritten);
+                logCmd.Parameters.AddWithValue("@FileCounter", fileCounter);
+                logCmd.Parameters.AddWithValue("@WriteDuration", writeDuration.HasValue ? writeDuration.Value : (object)DBNull.Value);
                 //logCmd.Parameters.AddWithValue("@LogID", (object)logId ?? DBNull.Value);
                 logCmd.ExecuteNonQuery();
             }
