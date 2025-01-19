@@ -1,6 +1,6 @@
-public void Main()
+        public void Main()
         {
-            string connString = Dts.Variables["User::CM_OLEDB_RAB"].Value.ToString();
+            string connString = Dts.Variables["User::CM_OLEDB_RADB"].Value.ToString();
             string folderPath = Dts.Variables["User::folderOutboundYaleHealth"].Value.ToString();
             string runSpecificProc = Dts.Variables["User::runSpecificProc"].Value.ToString();
 
@@ -20,7 +20,7 @@ public void Main()
                         // Process critical tasks sequentially
                         foreach (var config in criticalTasks)
                         {
-                            RunCriticalTask(connString, config, folderPath);
+                            ExecuteTask(connString, config, folderPath);
                         }
 
                         // Process non-critical tasks in parallel
@@ -42,35 +42,23 @@ public void Main()
             }
         }
 
-        private void RunCriticalTask(string connString, StoredProcConfig config, string folderPath)
-        {
-            try
-            {
-                using (var conn = CreateConnection(connString))
-                {
-                    ExecuteAndExportStoredProc(
-                        conn,
-                        config.StoredProcName,
-                        folderPath,
-                        config.FileNameTemplate,
-                        config.MaxFileLength);
-                    LogExecution(conn, config.StoredProcName, "Success", "Execution completed successfully.");
-                }
-            }
-            catch (Exception ex)
-            {
-                using (var conn = CreateConnection(connString))
-                {
-                    LogExecution(conn, config.StoredProcName, "Failure", ex.Message);
-                }
-            }
-        }
-
         private async System.Threading.Tasks.Task RunTaskAsync(SemaphoreSlim semaphore, string connString, StoredProcConfig config, string folderPath)
         {
             await semaphore.WaitAsync();
             try
             {
+                ExecuteTask(connString, config, folderPath);
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        private void ExecuteTask(string connString, StoredProcConfig config, string folderPath)
+        {
+            try
+            {
                 using (var conn = CreateConnection(connString))
                 {
                     ExecuteAndExportStoredProc(
@@ -86,12 +74,8 @@ public void Main()
             {
                 using (var conn = CreateConnection(connString))
                 {
-                    LogExecution(conn, config.StoredProcName, "Failure", ex.Message);
+                    LogExecution(conn, config.StoredProcName, "Failure", ex.Message, stackTrace: ex.StackTrace);
                 }
-            }
-            finally
-            {
-                semaphore.Release();
             }
         }
 
@@ -152,6 +136,8 @@ public void Main()
             var buffer = new StringBuilder(8192);
             bool headerWritten = false;
 
+            var stopwatch = Stopwatch.StartNew(); //Start timing the stored procedure execution
+
             try
             {
                 using (var cmd = new SqlCommand(storedProcName, conn))
@@ -168,11 +154,13 @@ public void Main()
 
                     Console.WriteLine($"Executing stored procedure: {storedProcName}");
 
-                    // Start the stopwatch to measure write time
-                    Stopwatch stopwatch = Stopwatch.StartNew();
-
                     using (var reader = cmd.ExecuteReader())
                     {
+                        stopwatch.Stop(); // Stop timing the stored procedure
+                        LogExecution(conn, storedProcName, "Success", $"Stored procedure executed in {stopwatch.ElapsedMilliseconds} ms.");
+
+                        var writeStopwatch = Stopwatch.StartNew(); // Start timing the file writing process
+
                         while (reader.Read())
                         {
                             if (!headerWritten)
@@ -198,14 +186,10 @@ public void Main()
                         {
                             FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
                         }
+
+                        writeStopwatch.Stop(); // Stop timing the file writing
+                        LogExecution(conn, storedProcName, "Success", "Success", bytesWritten, fileCounter, stopwatch.ElapsedMilliseconds);
                     }
-
-                    // Stop the stopwatch and log the duration
-                    stopwatch.Stop();
-                    TimeSpan duration = stopwatch.Elapsed;
-
-                    // Log successful execution
-                    LogExecution(conn, storedProcName, "Success", "Success", bytesWritten, fileCounter, stopwatch.ElapsedMilliseconds);
                 }
             }
             catch (Exception ex)
