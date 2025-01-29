@@ -59,7 +59,7 @@ private async System.Threading.Tasks.Task RunTaskAsync(SemaphoreSlim semaphore, 
     await semaphore.WaitAsync();
     try
     {
-        RetryTask(() => ExecuteTask(connString, config, folderPath), 3);
+        RetryTask(() => ExecuteTask(connString, config, folderPath), 3, config.WaitTimeMinutes);
     }
     finally
     {
@@ -67,7 +67,7 @@ private async System.Threading.Tasks.Task RunTaskAsync(SemaphoreSlim semaphore, 
     }
 }
 
-private void RetryTask(Action taskAction, int maxRetries)
+private void RetryTask(Action taskAction, int maxRetries, int waitTimeMinutes)
 {
     int attempts = 0;
     while (attempts < maxRetries)
@@ -75,7 +75,7 @@ private void RetryTask(Action taskAction, int maxRetries)
         try
         {
             taskAction();
-            return; // Exit the loop if the task succeeds
+            return; // Exit loop if successful
         }
         catch (Exception ex)
         {
@@ -84,6 +84,7 @@ private void RetryTask(Action taskAction, int maxRetries)
             {
                 throw new Exception($"Task failed after {maxRetries} attempts: {ex.Message}", ex);
             }
+            Thread.Sleep(waitTimeMinutes * 60 * 1000); // Wait before retry
         }
     }
 }
@@ -131,10 +132,13 @@ private List<StoredProcConfig> LoadConfigurations(SqlConnection conn, string run
             StoredProcedureName,
             StoredProcedureExecuteStatement,
             IsCritical,
-            MaxFileSize
+            MaxFileSize,
+            WaitTimeMinutes,
+            IsActive
         FROM YHP.YaleHealth_ETL_Objects
         WHERE
             StoredProcedureExecuteStatement IS NOT NULL
+            AND IsActive = 1
         ORDER BY 
             IsCritical DESC, 
             EtlProcessingOrder;";
@@ -154,13 +158,15 @@ private List<StoredProcConfig> LoadConfigurations(SqlConnection conn, string run
                     FileNameTemplate = reader["EtlOutputFileName"].ToString(),
                     MaxFileLength = Convert.ToInt32(reader["MaxFileSize"]),
                     IsCritical = Convert.ToBoolean(reader["IsCritical"]),
-                    EtlProcessingOrder = Convert.ToInt32(reader["EtlProcessingOrder"])
+                    EtlProcessingOrder = Convert.ToInt32(reader["EtlProcessingOrder"]),
+                    WaitTimeMinutes = Convert.ToInt32(reader["WaitTimeMinutes"])
                 });
             }
         }
     }
     return configurations;
 }
+
 
 private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcName, string folderPath,
                                             string fileNameTemplate, int maxFileLength)
@@ -182,12 +188,35 @@ private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcNam
             cmd.Parameters.AddWithValue("@CustomParameter1", DBNull.Value);
             cmd.Parameters.AddWithValue("@CustomParameter2", DBNull.Value);
             cmd.Parameters.AddWithValue("@DEBUG_FLAG", DBNull.Value);
-            cmd.Parameters.AddWithValue("@LOG_ID", DBNull.Value);
+            var logIdParam = new SqlParameter("@LOG_ID", SqlDbType.Int) { Direction = ParameterDirection.Output };
+            cmd.Parameters.Add(logIdParam);
+
+            // Add return value parameter
+            var returnCodeParam = new SqlParameter("@RC", SqlDbType.Int)
+            {
+                Direction = ParameterDirection.ReturnValue
+            };
+            cmd.Parameters.Add(returnCodeParam);
 
             Console.WriteLine($"Executing stored procedure: {storedProcName}");
-
             var procStopwatch = Stopwatch.StartNew();
 
+            // Execute the stored procedure
+            cmd.ExecuteNonQuery();
+
+            // Retrieve the return code
+            int returnCode = (int)returnCodeParam.Value;
+            int logId = logIdParam.Value != DBNull.Value ? (int)logIdParam.Value : 0;
+
+            // Check return code
+            if (returnCode != 0)
+            {
+                Console.WriteLine($"Stored procedure {storedProcName} failed with return code {returnCode}.");
+                LogExecution(conn, storedProcName, "Failure", $"Stored procedure returned {returnCode}", bytesWritten, fileCounter, 0);
+                return; // Stop further execution
+            }
+
+            // If return code is 0, proceed with exporting data
             using (var reader = cmd.ExecuteReader())
             {
                 while (reader.Read())
@@ -225,6 +254,7 @@ private void ExecuteAndExportStoredProc(SqlConnection conn, string storedProcNam
         throw;
     }
 }
+
 
 private void WriteHeader(SqlDataReader reader, StringBuilder buffer)
 {
@@ -293,4 +323,5 @@ public class StoredProcConfig
     public int MaxFileLength { get; set; }
     public bool IsCritical { get; set; }
     public int EtlProcessingOrder { get; set; }
+    public int WaitTimeMinutes { get; set; } // New property
 }
