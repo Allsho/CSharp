@@ -1,3 +1,15 @@
+DECLARE @RC					INT
+DECLARE @DateStarting		DATETIME
+DECLARE @DateEnding			DATETIME
+DECLARE @CustomParameter1	VARCHAR(2048)
+DECLARE @CustomParameter2	VARCHAR(2048)
+DECLARE @DEBUG_FLAG			BIT
+DECLARE @LOG_ID				INT
+
+EXECUTE @RC = [YHP].[ACCESS_LOG] @DateStarting, @DateEnding, @CustomParameter1, @CustomParameter2, @DEBUG_FLAG, @LOG_ID OUTPUT
+
+SELECT @RC AS [@RC], @LOG_ID AS [@LOG_ID]
+
 public void Main()
 {
     string connString = Dts.Variables["User::CM_OLEDB_RAB"].Value.ToString();
