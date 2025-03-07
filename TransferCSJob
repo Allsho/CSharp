@@ -1,0 +1,203 @@
+using System;
+using System.Data.SqlClient;
+using System.IO;
+using System.IO.Compression;
+using Microsoft.SqlServer.Dts.Runtime;
+
+public void Main()
+{
+    string connectionString = "Data Source=YourSQLServer;Initial Catalog=YourDatabase;Integrated Security=True;";
+    string query = "SELECT * FROM FileProcessingMapping WHERE IsActive = 1 ORDER BY Payor, Step";
+
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                ProcessFileTransfer(conn, reader);
+            }
+        }
+    }
+
+    Dts.TaskResult = (int)ScriptResults.Success;
+}
+
+private void ProcessFileTransfer(SqlConnection conn, SqlDataReader reader)
+{
+    string payor = reader["Payor"].ToString();
+    int step = Convert.ToInt32(reader["Step"]);
+    string sourcePath = reader["SourcePath"].ToString();
+    string destinationPath = reader["DestinationPath"].ToString();
+    string filePattern = reader["FilePattern"].ToString();
+    string actionType = reader["ActionType"].ToString();
+    bool isBatch = Convert.ToBoolean(reader["IsBatch"]);
+    string batchFileName = reader["BatchFileName"] != DBNull.Value ? reader["BatchFileName"].ToString() : null;
+    bool removeExtension = Convert.ToBoolean(reader["RemoveExtension"]);
+    string newFileName = reader["NewFileName"] != DBNull.Value ? reader["NewFileName"].ToString() : null;
+    string archiveSubFolder = reader["ArchiveSubFolder"] != DBNull.Value ? reader["ArchiveSubFolder"].ToString() : null;
+
+    if (!Directory.Exists(sourcePath))
+    {
+        LogFileTransfer(conn, sourcePath, destinationPath, filePattern, actionType, "Failed", "Source directory does not exist.");
+        return;
+    }
+
+    string[] files = Directory.GetFiles(sourcePath, filePattern);
+    if (files.Length == 0)
+    {
+        LogFileTransfer(conn, sourcePath, destinationPath, filePattern, actionType, "No Files Found", "");
+        return;
+    }
+
+    // Apply exclusion patterns
+    string exclusionQuery = "SELECT Pattern FROM ExclusionPatterns WHERE Payor = @Payor AND Step = @Step";
+    using (SqlCommand exclusionCmd = new SqlCommand(exclusionQuery, conn))
+    {
+        exclusionCmd.Parameters.AddWithValue("@Payor", payor);
+        exclusionCmd.Parameters.AddWithValue("@Step", step);
+        using (SqlDataReader exclusionReader = exclusionCmd.ExecuteReader())
+        {
+            while (exclusionReader.Read())
+            {
+                string exclusionPattern = exclusionReader["Pattern"].ToString();
+                files = Array.FindAll(files, file => !file.Contains(exclusionPattern, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+    }
+
+    if (files.Length == 0)
+    {
+        LogFileTransfer(conn, sourcePath, destinationPath, filePattern, actionType, "No Files Found After Filtering", "");
+        return;
+    }
+
+    // Ensure the destination directory exists, creating it if necessary
+    if (!Directory.Exists(destinationPath))
+    {
+        Directory.CreateDirectory(destinationPath);
+    }
+
+    // Handle the creation of an archive subfolder if specified
+    if (!string.IsNullOrEmpty(archiveSubFolder))
+    {
+        destinationPath = Path.Combine(destinationPath, archiveSubFolder);
+        if (!Directory.Exists(destinationPath))
+        {
+            Directory.CreateDirectory(destinationPath);
+        }
+    }
+
+    try
+    {
+        if (isBatch && actionType == "Zip")
+        {
+            BatchZipOperation(destinationPath, batchFileName, files);
+        }
+        else
+        {
+            foreach (string file in files)
+            {
+                HandleFileOperation(file, destinationPath, actionType, removeExtension, newFileName);
+            }
+        }
+        LogFileTransfer(conn, sourcePath, destinationPath, batchFileName ?? filePattern, actionType, "Success", "");
+    }
+    catch (Exception ex)
+    {
+        LogFileTransfer(conn, sourcePath, destinationPath, batchFileName ?? filePattern, actionType, "Failed", ex.Message);
+    }
+}
+
+private void BatchZipOperation(string destinationPath, string batchFileName, string[] files)
+{
+    string zipFilePath = Path.Combine(destinationPath, batchFileName);
+    using (ZipArchive zip = ZipFile.Open(zipFilePath, ZipArchiveMode.Create))
+    {
+        foreach (string file in files)
+        {
+            zip.CreateEntryFromFile(file, Path.GetFileName(file), CompressionLevel.Optimal);
+        }
+    }
+}
+
+private void HandleFileOperation(string file, string destinationPath, string actionType, bool removeExtension, string newFileName)
+{
+    string fileName = Path.GetFileName(file);
+    string destinationFile = Path.Combine(destinationPath, fileName);
+
+    if (removeExtension)
+    {
+        destinationFile = Path.Combine(destinationPath, Path.GetFileNameWithoutExtension(file));
+    }
+    else if (!string.IsNullOrEmpty(newFileName))
+    {
+        destinationFile = Path.Combine(destinationPath, newFileName);
+    }
+
+    switch (actionType)
+    {
+        case "Move":
+            if (File.Exists(destinationFile))
+            {
+                throw new Exception("File already exists in destination.");
+            }
+            File.Move(file, destinationFile);
+            break;
+        case "Copy":
+            if (!File.Exists(destinationFile))
+            {
+                File.Copy(file, destinationFile);
+            }
+            break;
+        case "Zip":
+            string zipFile = destinationFile + ".zip";
+            using (ZipArchive zip = ZipFile.Open(zipFile, ZipArchiveMode.Create))
+            {
+                zip.CreateEntryFromFile(file, fileName, CompressionLevel.Optimal);
+            }
+            break;
+        case "Unzip":
+            ZipFile.ExtractToDirectory(file, destinationPath);
+            break;
+        case "Rename":
+            if (File.Exists(destinationFile))
+            {
+                throw new Exception("Renamed file already exists in destination.");
+            }
+            File.Move(file, destinationFile);
+            break;
+    }
+
+    // Archive the file based on the current YYYYMM inside each payor folder
+    string archivePath = Path.Combine(destinationPath, DateTime.Now.ToString("yyyyMM"));
+    if (!Directory.Exists(archivePath))
+    {
+        Directory.CreateDirectory(archivePath);
+    }
+    string archiveFile = Path.Combine(archivePath, Path.GetFileName(destinationFile));
+    if (File.Exists(archiveFile))
+    {
+        File.Delete(archiveFile);
+    }
+    File.Move(destinationFile, archiveFile);
+}
+
+private void LogFileTransfer(SqlConnection conn, string sourcePath, string destinationPath, string fileName, string actionType, string status, string errorMessage)
+{
+    string logQuery = @"INSERT INTO FileTransferLog (SourcePath, DestinationPath, FileName, ActionType, TransferTime, Status, ErrorMessage)
+                        VALUES (@SourcePath, @DestinationPath, @FileName, @ActionType, GETDATE(), @Status, @ErrorMessage)";
+
+    using (SqlCommand logCmd = new SqlCommand(logQuery, conn))
+    {
+        logCmd.Parameters.AddWithValue("@SourcePath", sourcePath);
+        logCmd.Parameters.AddWithValue("@DestinationPath", destinationPath);
+        logCmd.Parameters.AddWithValue("@FileName", fileName);
+        logCmd.Parameters.AddWithValue("@ActionType", actionType);
+        logCmd.Parameters.AddWithValue("@Status", status);
+        logCmd.Parameters.AddWithValue("@ErrorMessage", errorMessage);
+        logCmd.ExecuteNonQuery();
+    }
+}
