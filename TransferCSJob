@@ -1,24 +1,30 @@
-using System;
-using System.Data.SqlClient;
-using System.IO;
-using System.IO.Compression;
-using Microsoft.SqlServer.Dts.Runtime;
-
 public void Main()
 {
     string connectionString = "Data Source=YourSQLServer;Initial Catalog=YourDatabase;Integrated Security=True;";
-    string query = "SELECT * FROM FileProcessingMapping WHERE IsActive = 1 ORDER BY Payor, Step";
+    string query = @"
+        SELECT 
+            fpm.*, 
+            ep.Pattern AS ExclusionPattern 
+        FROM 
+            FileProcessingMapping fpm
+        LEFT JOIN 
+            ExclusionPatterns ep 
+        ON 
+            fpm.Payor = ep.Payor AND fpm.Step = ep.Step
+        WHERE 
+            fpm.IsActive = 1 
+        ORDER BY 
+            fpm.Payor, fpm.Step";
 
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
-        conn.Open();  // Open a single connection for the entire process
-
+        conn.Open();
         using (SqlCommand cmd = new SqlCommand(query, conn))
         using (SqlDataReader reader = cmd.ExecuteReader())
         {
             while (reader.Read())
             {
-                ProcessFileTransfer(conn, reader);
+                ProcessFileTransfer(reader);
             }
         }
     }
@@ -26,7 +32,7 @@ public void Main()
     Dts.TaskResult = (int)ScriptResults.Success;
 }
 
-private void ProcessFileTransfer(SqlConnection conn, SqlDataReader reader)
+private void ProcessFileTransfer(SqlDataReader reader)
 {
     string payor = reader["Payor"].ToString();
     int step = Convert.ToInt32(reader["Step"]);
@@ -42,22 +48,37 @@ private void ProcessFileTransfer(SqlConnection conn, SqlDataReader reader)
 
     if (!Directory.Exists(sourcePath))
     {
-        LogFileTransfer(conn, sourcePath, destinationPath, filePattern, actionType, "Failed", "Source directory does not exist.");
+        LogFileTransfer(sourcePath, destinationPath, filePattern, actionType, "Failed", "Source directory does not exist.");
         return;
     }
 
     string[] files = Directory.GetFiles(sourcePath, filePattern);
     if (files.Length == 0)
     {
-        LogFileTransfer(conn, sourcePath, destinationPath, filePattern, actionType, "No Files Found", "");
+        LogFileTransfer(sourcePath, destinationPath, filePattern, actionType, "No Files Found", "");
         return;
     }
 
     // Apply exclusion patterns
-    ApplyExclusionPatterns(conn, payor, step, ref files);
+    List<string> exclusionPatterns = new List<string>();
+    if (!reader.IsDBNull(reader.GetOrdinal("ExclusionPattern")))
+    {
+        exclusionPatterns.Add(reader["ExclusionPattern"].ToString());
+    }
+
+    files = Array.FindAll(files, file =>
+    {
+        foreach (string pattern in exclusionPatterns)
+        {
+            if (file.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0)
+                return false;
+        }
+        return true;
+    });
+
     if (files.Length == 0)
     {
-        LogFileTransfer(conn, sourcePath, destinationPath, filePattern, actionType, "No Files Found After Filtering", "");
+        LogFileTransfer(sourcePath, destinationPath, filePattern, actionType, "No Files Found After Filtering", "");
         return;
     }
 
@@ -81,29 +102,11 @@ private void ProcessFileTransfer(SqlConnection conn, SqlDataReader reader)
                 HandleFileOperation(file, destinationPath, actionType, removeExtension, newFileName);
             }
         }
-        LogFileTransfer(conn, sourcePath, destinationPath, batchFileName ?? filePattern, actionType, "Success", "");
+        LogFileTransfer(sourcePath, destinationPath, batchFileName ?? filePattern, actionType, "Success", "");
     }
     catch (Exception ex)
     {
-        LogFileTransfer(conn, sourcePath, destinationPath, batchFileName ?? filePattern, actionType, "Failed", ex.Message);
-    }
-}
-
-private void ApplyExclusionPatterns(SqlConnection conn, string payor, int step, ref string[] files)
-{
-    string exclusionQuery = "SELECT Pattern FROM ExclusionPatterns WHERE Payor = @Payor AND Step = @Step";
-    using (SqlCommand exclusionCmd = new SqlCommand(exclusionQuery, conn))
-    {
-        exclusionCmd.Parameters.AddWithValue("@Payor", payor);
-        exclusionCmd.Parameters.AddWithValue("@Step", step);
-        using (SqlDataReader exclusionReader = exclusionCmd.ExecuteReader())
-        {
-            while (exclusionReader.Read())
-            {
-                string exclusionPattern = exclusionReader["Pattern"].ToString();
-                files = Array.FindAll(files, file => file.IndexOf(exclusionPattern, StringComparison.OrdinalIgnoreCase) < 0);
-            }
-        }
+        LogFileTransfer(sourcePath, destinationPath, batchFileName ?? filePattern, actionType, "Failed", ex.Message);
     }
 }
 
@@ -176,19 +179,23 @@ private void EnsureDirectoryExists(string path)
     if (!Directory.Exists(path)) Directory.CreateDirectory(path);
 }
 
-private void LogFileTransfer(SqlConnection conn, string sourcePath, string destinationPath, string fileName, string actionType, string status, string errorMessage)
+private void LogFileTransfer(string sourcePath, string destinationPath, string fileName, string actionType, string status, string errorMessage)
 {
     string logQuery = @"INSERT INTO FileTransferLog (SourcePath, DestinationPath, FileName, ActionType, TransferTime, Status, ErrorMessage)
                         VALUES (@SourcePath, @DestinationPath, @FileName, @ActionType, GETDATE(), @Status, @ErrorMessage)";
 
-    using (SqlCommand logCmd = new SqlCommand(logQuery, conn))
+    using (SqlConnection conn = new SqlConnection(connectionString))
     {
-        logCmd.Parameters.AddWithValue("@SourcePath", sourcePath);
-        logCmd.Parameters.AddWithValue("@DestinationPath", destinationPath);
-        logCmd.Parameters.AddWithValue("@FileName", fileName);
-        logCmd.Parameters.AddWithValue("@ActionType", actionType);
-        logCmd.Parameters.AddWithValue("@Status", status);
-        logCmd.Parameters.AddWithValue("@ErrorMessage", errorMessage);
-        logCmd.ExecuteNonQuery();
+        conn.Open();
+        using (SqlCommand logCmd = new SqlCommand(logQuery, conn))
+        {
+            logCmd.Parameters.AddWithValue("@SourcePath", sourcePath);
+            logCmd.Parameters.AddWithValue("@DestinationPath", destinationPath);
+            logCmd.Parameters.AddWithValue("@FileName", fileName);
+            logCmd.Parameters.AddWithValue("@ActionType", actionType);
+            logCmd.Parameters.AddWithValue("@Status", status);
+            logCmd.Parameters.AddWithValue("@ErrorMessage", errorMessage);
+            logCmd.ExecuteNonQuery();
+        }
     }
 }
