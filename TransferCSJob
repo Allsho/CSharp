@@ -11,7 +11,8 @@ public void Main()
 
     using (SqlConnection conn = new SqlConnection(connectionString))
     {
-        conn.Open();
+        conn.Open();  // Open a single connection for the entire process
+
         using (SqlCommand cmd = new SqlCommand(query, conn))
         using (SqlDataReader reader = cmd.ExecuteReader())
         {
@@ -34,10 +35,10 @@ private void ProcessFileTransfer(SqlConnection conn, SqlDataReader reader)
     string filePattern = reader["FilePattern"].ToString();
     string actionType = reader["ActionType"].ToString();
     bool isBatch = Convert.ToBoolean(reader["IsBatch"]);
-    string batchFileName = reader["BatchFileName"] != DBNull.Value ? reader["BatchFileName"].ToString() : null;
+    string batchFileName = reader["BatchFileName"] as string;
     bool removeExtension = Convert.ToBoolean(reader["RemoveExtension"]);
-    string newFileName = reader["NewFileName"] != DBNull.Value ? reader["NewFileName"].ToString() : null;
-    string archiveSubFolder = reader["ArchiveSubFolder"] != DBNull.Value ? reader["ArchiveSubFolder"].ToString() : null;
+    string newFileName = reader["NewFileName"] as string;
+    string archiveSubFolder = reader["ArchiveSubFolder"] as string;
 
     if (!Directory.Exists(sourcePath))
     {
@@ -53,41 +54,18 @@ private void ProcessFileTransfer(SqlConnection conn, SqlDataReader reader)
     }
 
     // Apply exclusion patterns
-    string exclusionQuery = "SELECT Pattern FROM ExclusionPatterns WHERE Payor = @Payor AND Step = @Step";
-    using (SqlCommand exclusionCmd = new SqlCommand(exclusionQuery, conn))
-    {
-        exclusionCmd.Parameters.AddWithValue("@Payor", payor);
-        exclusionCmd.Parameters.AddWithValue("@Step", step);
-        using (SqlDataReader exclusionReader = exclusionCmd.ExecuteReader())
-        {
-            while (exclusionReader.Read())
-            {
-                string exclusionPattern = exclusionReader["Pattern"].ToString();
-                files = Array.FindAll(files, file => !file.Contains(exclusionPattern, StringComparison.OrdinalIgnoreCase));
-            }
-        }
-    }
-
+    ApplyExclusionPatterns(conn, payor, step, ref files);
     if (files.Length == 0)
     {
         LogFileTransfer(conn, sourcePath, destinationPath, filePattern, actionType, "No Files Found After Filtering", "");
         return;
     }
 
-    // Ensure the destination directory exists, creating it if necessary
-    if (!Directory.Exists(destinationPath))
-    {
-        Directory.CreateDirectory(destinationPath);
-    }
-
-    // Handle the creation of an archive subfolder if specified
+    EnsureDirectoryExists(destinationPath);
     if (!string.IsNullOrEmpty(archiveSubFolder))
     {
         destinationPath = Path.Combine(destinationPath, archiveSubFolder);
-        if (!Directory.Exists(destinationPath))
-        {
-            Directory.CreateDirectory(destinationPath);
-        }
+        EnsureDirectoryExists(destinationPath);
     }
 
     try
@@ -108,6 +86,24 @@ private void ProcessFileTransfer(SqlConnection conn, SqlDataReader reader)
     catch (Exception ex)
     {
         LogFileTransfer(conn, sourcePath, destinationPath, batchFileName ?? filePattern, actionType, "Failed", ex.Message);
+    }
+}
+
+private void ApplyExclusionPatterns(SqlConnection conn, string payor, int step, ref string[] files)
+{
+    string exclusionQuery = "SELECT Pattern FROM ExclusionPatterns WHERE Payor = @Payor AND Step = @Step";
+    using (SqlCommand exclusionCmd = new SqlCommand(exclusionQuery, conn))
+    {
+        exclusionCmd.Parameters.AddWithValue("@Payor", payor);
+        exclusionCmd.Parameters.AddWithValue("@Step", step);
+        using (SqlDataReader exclusionReader = exclusionCmd.ExecuteReader())
+        {
+            while (exclusionReader.Read())
+            {
+                string exclusionPattern = exclusionReader["Pattern"].ToString();
+                files = Array.FindAll(files, file => file.IndexOf(exclusionPattern, StringComparison.OrdinalIgnoreCase) < 0);
+            }
+        }
     }
 }
 
@@ -140,17 +136,11 @@ private void HandleFileOperation(string file, string destinationPath, string act
     switch (actionType)
     {
         case "Move":
-            if (File.Exists(destinationFile))
-            {
-                throw new Exception("File already exists in destination.");
-            }
+            if (File.Exists(destinationFile)) throw new Exception("File already exists in destination.");
             File.Move(file, destinationFile);
             break;
         case "Copy":
-            if (!File.Exists(destinationFile))
-            {
-                File.Copy(file, destinationFile);
-            }
+            if (!File.Exists(destinationFile)) File.Copy(file, destinationFile);
             break;
         case "Zip":
             string zipFile = destinationFile + ".zip";
@@ -163,26 +153,27 @@ private void HandleFileOperation(string file, string destinationPath, string act
             ZipFile.ExtractToDirectory(file, destinationPath);
             break;
         case "Rename":
-            if (File.Exists(destinationFile))
-            {
-                throw new Exception("Renamed file already exists in destination.");
-            }
+            if (File.Exists(destinationFile)) throw new Exception("Renamed file already exists in destination.");
             File.Move(file, destinationFile);
             break;
     }
 
-    // Archive the file based on the current YYYYMM inside each payor folder
+    ArchiveFile(destinationPath, destinationFile);
+}
+
+private void ArchiveFile(string destinationPath, string destinationFile)
+{
     string archivePath = Path.Combine(destinationPath, DateTime.Now.ToString("yyyyMM"));
-    if (!Directory.Exists(archivePath))
-    {
-        Directory.CreateDirectory(archivePath);
-    }
+    EnsureDirectoryExists(archivePath);
     string archiveFile = Path.Combine(archivePath, Path.GetFileName(destinationFile));
-    if (File.Exists(archiveFile))
-    {
-        File.Delete(archiveFile);
-    }
+
+    if (File.Exists(archiveFile)) File.Delete(archiveFile);
     File.Move(destinationFile, archiveFile);
+}
+
+private void EnsureDirectoryExists(string path)
+{
+    if (!Directory.Exists(path)) Directory.CreateDirectory(path);
 }
 
 private void LogFileTransfer(SqlConnection conn, string sourcePath, string destinationPath, string fileName, string actionType, string status, string errorMessage)
