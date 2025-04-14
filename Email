@@ -19,3 +19,44 @@
 		</div>
 	</body>
 </html>
+
+
+internal static class Emailer
+{
+    internal static void SendEmail(SqlConnection conn, string emailType, string message, string smtpServer) //, string smtpServer
+    {
+        const string query = "SELECT TOP 1 * FROM YHP.ETLEmailSettings WHERE EmailType = @EmailType";
+        using (var cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@EmailType", emailType);
+            using (var reader = cmd.ExecuteReader())
+            {
+                if (reader.Read())
+                {
+                    string recipients = reader["Recipients"].ToString();
+                    string sender = reader["Sender"].ToString();
+                    string subject = reader["SubjectTemplate"].ToString();
+                    string body = reader["BodyTemplate"].ToString().Replace("{Message}", message);
+
+                    // Create a new mail message and set IsBodyHtml to true
+                    MailMessage mail = new MailMessage();
+                    mail.From = new MailAddress(sender);
+                    mail.Subject = subject;
+                    mail.Body = body;
+                    mail.IsBodyHtml = true; // Enable HTML formatting
+
+                    // Add each recipient email address
+                    foreach (var recipient in recipients.Split(',').Select(a => a.Trim()))
+                    {
+                        mail.To.Add(recipient);
+                    }
+
+                    // Configure the SMTP client using connection manager settings
+                    SmtpClient smtpClient = new SmtpClient(smtpServer);
+                    smtpClient.UseDefaultCredentials = true; // Use credentials from the connection manager
+                    smtpClient.Send(mail);
+                }
+            }
+        }
+    }
+}
