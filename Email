@@ -120,3 +120,25 @@ internal static class Emailer
 	</div>
 </body>
 </html>
+
+<html>
+  <body style="font-family: Segoe UI, Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f4; margin: 0; padding: 0;">
+    <div style="max-width: 600px; margin: 30px auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden;">
+      
+      <!-- Header -->
+      <div style="background-color: #28a745; color: white; padding: 20px; text-align: center;">
+        <h1 style="margin: 0; font-size: 24px;">✅ ETL Process Completed</h1>
+      </div>
+
+      <!-- Content -->
+      <div style="padding: 20px; color: #333; font-size: 16px;">
+        <p style="margin: 0;">The ETL process has completed successfully without any issues.</p>
+      </div>
+
+      <!-- Footer -->
+      <div style="background-color: #f9f9f9; color: #888; padding: 15px; text-align: center; font-size: 12px; border-top: 1px solid #eee;">
+        <p style="margin: 0;">This is an automated notification. Please do not reply to this email.</p>
+      </div>
+    </div>
+  </body>
+</html>
