@@ -60,3 +60,63 @@ internal static class Emailer
         }
     }
 }
+
+<html>
+<head>
+	<style>
+		body {
+			font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+			background-color: #f4f4f4;
+			margin: 0;
+			padding: 0;
+		}
+		.container {
+			max-width: 600px;
+			margin: 30px auto;
+			background-color: #ffffff;
+			border-radius: 8px;
+			box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+			overflow: hidden;
+		}
+		.header {
+			background-color: #28a745;
+			color: white;
+			padding: 20px;
+			text-align: center;
+		}
+		.header h1 {
+			margin: 0;
+			font-size: 24px;
+		}
+		.content {
+			padding: 20px;
+			color: #333;
+			font-size: 16px;
+		}
+		.content p {
+			margin: 0;
+		}
+		.footer {
+			background-color: #f9f9f9;
+			color: #888;
+			padding: 15px;
+			text-align: center;
+			font-size: 12px;
+			border-top: 1px solid #eee;
+		}
+	</style>
+</head>
+<body>
+	<div class="container">
+		<div class="header">
+			<h1>✅ ETL Process Completed</h1>
+		</div>
+		<div class="content">
+			<p>The ETL process has completed successfully without any issues.</p>
+		</div>
+		<div class="footer">
+			<p>This is an automated notification. Please do not reply to this email.</p>
+		</div>
+	</div>
+</body>
+</html>
