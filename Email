@@ -167,3 +167,28 @@ internal static class Emailer
 		</div>
 	</body>
 </html>
+
+<html>
+  <body style="font-family: Arial, sans-serif; line-height: 1.6; background-color: #f9f9f9; margin: 0; padding: 0;">
+    <div style="max-width: 700px; margin: 30px auto; background-color: #ffffff; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden;">
+
+      <!-- Header -->
+      <div style="background-color: #f44336; color: white; padding: 20px; text-align: center;">
+        <h1 style="margin: 0; font-size: 24px;">❌ ETL Process Failure</h1>
+      </div>
+
+      <!-- Content -->
+      <div style="padding: 20px; color: #333333;">
+        <p style="margin: 0 0 10px;"><strong>Stored Procedure:</strong> {StoredProcName}</p>
+        <p style="margin: 0 0 10px;"><strong>Error Message:</strong> {Message}</p>
+        <p style="margin: 0 0 5px;"><strong>Stack Trace:</strong></p>
+        <pre style="background-color: #f8f8f8; padding: 10px; border: 1px solid #ddd; border-radius: 4px; overflow-x: auto; font-size: 13px;">{StackTrace}</pre>
+      </div>
+
+      <!-- Footer -->
+      <div style="background-color: #f1f1f1; color: #666666; padding: 15px; text-align: center; font-size: 12px; border-top: 1px solid #e0e0e0;">
+        <p style="margin: 0;">This is an automated message. Please do not reply. <br>🧘‍♂️ And hey — take the rest of the day off.</p>
+      </div>
+    </div>
+  </body>
+</html>
