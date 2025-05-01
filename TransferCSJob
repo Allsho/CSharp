@@ -1,201 +1,338 @@
-public void Main()
-{
-    string connectionString = "Data Source=YourSQLServer;Initial Catalog=YourDatabase;Integrated Security=True;";
-    string query = @"
-        SELECT 
-            fpm.*, 
-            ep.Pattern AS ExclusionPattern 
-        FROM 
-            FileProcessingMapping fpm
-        LEFT JOIN 
-            ExclusionPatterns ep 
-        ON 
-            fpm.Payor = ep.Payor AND fpm.Step = ep.Step
-        WHERE 
-            fpm.IsActive = 1 
-        ORDER BY 
-            fpm.Payor, fpm.Step";
+#region Help:  Introduction to the script task
+/* The Script Task allows you to perform virtually any operation that can be accomplished in
+ * a .Net application within the context of an Integration Services control flow. 
+ * 
+ * Expand the other regions which have "Help" prefixes for examples of specific ways to use
+ * Integration Services features within this script task. */
+#endregion
 
-    using (SqlConnection conn = new SqlConnection(connectionString))
-    {
-        conn.Open();
-        using (SqlCommand cmd = new SqlCommand(query, conn))
-        using (SqlDataReader reader = cmd.ExecuteReader())
-        {
-            while (reader.Read())
+
+#region Namespaces
+using System;
+using System.Data;
+using Microsoft.SqlServer.Dts.Runtime;
+using System.Windows.Forms;
+using System.IO;
+using System.IO.Compression;
+using System.Diagnostics.Eventing.Reader;
+using System.Linq.Expressions;
+#endregion
+
+namespace ST_12db60d6be20402bac3b00f294317978
+{
+    /// <summary>
+    /// ScriptMain is the entry point class of the script.  Do not change the name, attributes,
+    /// or parent of this class.
+    /// </summary>
+	[Microsoft.SqlServer.Dts.Tasks.ScriptTask.SSISScriptTaskEntryPointAttribute]
+	public partial class ScriptMain : Microsoft.SqlServer.Dts.Tasks.ScriptTask.VSTARTScriptObjectModelBase
+	{
+        #region Help:  Using Integration Services variables and parameters in a script
+        /* To use a variable in this script, first ensure that the variable has been added to 
+         * either the list contained in the ReadOnlyVariables property or the list contained in 
+         * the ReadWriteVariables property of this script task, according to whether or not your
+         * code needs to write to the variable.  To add the variable, save this script, close this instance of
+         * Visual Studio, and update the ReadOnlyVariables and 
+         * ReadWriteVariables properties in the Script Transformation Editor window.
+         * To use a parameter in this script, follow the same steps. Parameters are always read-only.
+         * 
+         * Example of reading from a variable:
+         *  DateTime startTime = (DateTime) Dts.Variables["System::StartTime"].Value;
+         * 
+         * Example of writing to a variable:
+         *  Dts.Variables["User::myStringVariable"].Value = "new value";
+         * 
+         * Example of reading from a package parameter:
+         *  int batchId = (int) Dts.Variables["$Package::batchId"].Value;
+         *  
+         * Example of reading from a project parameter:
+         *  int batchId = (int) Dts.Variables["$Project::batchId"].Value;
+         * 
+         * Example of reading from a sensitive project parameter:
+         *  int batchId = (int) Dts.Variables["$Project::batchId"].GetSensitiveValue();
+         * */
+
+        #endregion
+
+        #region Help:  Firing Integration Services events from a script
+        /* This script task can fire events for logging purposes.
+         * 
+         * Example of firing an error event:
+         *  Dts.Events.FireError(18, "Process Values", "Bad value", "", 0);
+         * 
+         * Example of firing an information event:
+         *  Dts.Events.FireInformation(3, "Process Values", "Processing has started", "", 0, ref fireAgain)
+         * 
+         * Example of firing a warning event:
+         *  Dts.Events.FireWarning(14, "Process Values", "No values received for input", "", 0);
+         * */
+        #endregion
+
+        #region Help:  Using Integration Services connection managers in a script
+        /* Some types of connection managers can be used in this script task.  See the topic 
+         * "Working with Connection Managers Programatically" for details.
+         * 
+         * Example of using an ADO.Net connection manager:
+         *  object rawConnection = Dts.Connections["Sales DB"].AcquireConnection(Dts.Transaction);
+         *  SqlConnection myADONETConnection = (SqlConnection)rawConnection;
+         *  //Use the connection in some code here, then release the connection
+         *  Dts.Connections["Sales DB"].ReleaseConnection(rawConnection);
+         *
+         * Example of using a File connection manager
+         *  object rawConnection = Dts.Connections["Prices.zip"].AcquireConnection(Dts.Transaction);
+         *  string filePath = (string)rawConnection;
+         *  //Use the connection in some code here, then release the connection
+         *  Dts.Connections["Prices.zip"].ReleaseConnection(rawConnection);
+         * */
+        #endregion
+
+
+		/// <summary>
+        /// This method is called when this script task executes in the control flow.
+        /// Before returning from this method, set the value of Dts.TaskResult to indicate success or failure.
+        /// To open Help, press F1.
+        /// </summary>
+		public void Main()
+		{
+			// Variables passed from SSIS
+            string mappingID = Dts.Variables["User::MappingID"].Value.ToString();
+            string actionType = Dts.Variables["User::ActionType"].Value.ToString();
+            string sourceFolder = Dts.Variables["User::SourceFolder"].Value.ToString();
+            string destinationFolder = Dts.Variables["User::DestinationFolder"].Value.ToString();
+            string filePattern = Dts.Variables["User::FilePattern"].Value.ToString();
+            string exclusionList = Dts.Variables["User::ExclusionList"].Value.ToString();
+            string zipName = Dts.Variables["User::ZipName"].Value.ToString();
+
+            // Grouping logic
+            string payerName = Dts.Variables["User::PayerName"].Value.ToString();
+            int sequence = Convert.ToInt32(Dts.Variables["User::Sequence"].Value);
+
+            // Static vairables
+            string currentPayer = null;
+            bool hasFiles = false;
+
+            try
             {
-                ProcessFileTransfer(reader);
+                if (sequence == 1)
+                {
+                    string[] matchingFiles = Directory.GetFiles(sourceFolder, filePattern);
+                    if (matchingFiles.Length == 0)
+                    {
+                        Console.WriteLine($"No files found in SourceFolder ' {sourceFolder}' for pattern '{filePattern}'. Skipping payer step.");
+                        LogOperation("No Files Found", "Success", $"Skipped - No files found for {payerName}.");
+                        Dts.TaskResult = (int)ScriptResults.Success;
+                        return;
+                    }
+                    hasFiles = true;
+                    currentPayer = payerName;
+                }
+                else if (payerName != currentPayer || !hasFiles)
+                {
+                    LogOperation("No Files Found", "Success", "Skipped - Seq1 had no files.");
+                    Dts.TaskResult = (int)ScriptResults.Success;
+                    return;
+                }
+
+                // Perform action based on ActionType
+                switch (actionType)
+                {
+                    case "Move":
+                        MoveFiles(sourceFolder, destinationFolder, filePattern, exclusionList);
+                        break;
+
+                    case "Copy":
+                        CopyFiles(sourceFolder, destinationFolder, filePattern, exclusionList);
+                        break;
+
+                    case "Zip":
+                        ZipFiles(sourceFolder, destinationFolder, filePattern, exclusionList, zipName);
+                        break;
+
+                    default:
+                        throw new Exception("Unknown ActionType: " + actionType);
+                }
+
+                Dts.TaskResult = (int)ScriptResults.Success;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in Main(): {ex.Message}");
+                LogOperation("Error in Main()", "Failure", ex.Message);
+                Dts.TaskResult = (int)ScriptResults.Failure;
+            }
+		}
+
+        // Move Files with Exclusion logic
+        private void MoveFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList)
+        {
+            ProcessFiles(sourceFolder, destinationFolder, filePattern, exclusionList, true);
+        }
+
+        // Copy Files with Exclusion Logic
+        private void CopyFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList)
+        {
+            ProcessFiles(sourceFolder, destinationFolder, filePattern, exclusionList, false);
+        }
+
+        // Zip Files and Move to Outbound
+        private void ZipFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, string zipName)
+        {
+            try
+            {
+                if (!Directory.Exists(sourceFolder))
+                    throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
+
+                if (!Directory.Exists(destinationFolder))
+                    throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
+                    //Directory.CreateDirectory(destinationFolder);
+
+                // Convert exclusion list into an array
+                string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+
+                // Get all files from source folder
+                string[] files = Directory.GetFiles(sourceFolder, filePattern);
+
+                // Generate zip file name based on timestamp
+                string zipFileName = Path.Combine(destinationFolder, $"{zipName}_{DateTime.Now:yyyyMM}.zip");
+
+                // Create and write to zip file
+                using (ZipArchive archive = ZipFile.Open(zipFileName, ZipArchiveMode.Create))
+                {
+                    foreach (string file in files)
+                    {
+                        string fileName = Path.GetFileName(file);
+
+                        // Ensure the file is directly inside the source folder
+                        if (!file.StartsWith(sourceFolder, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Console.WriteLine($"Skipped file outside source folder: {fileName}");
+                            continue;
+                        }
+
+                        // Check Exclusion List using Contains
+                        if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
+                        {
+                            Console.WriteLine($"Exlcuded file: {fileName}");
+                            continue;
+                        }
+
+                        try
+                        {
+                            archive.CreateEntryFromFile(file, fileName);
+                            Console.WriteLine($"Zipped: {fileName}");
+                            LogOperation(fileName, "Success", "File compressed successfully.");
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error zipping file: {fileName}. Error: {ex.Message}");
+                            LogOperation(fileName, "Failure", ex.Message);
+                        }
+                    }
+                }
+
+                Console.WriteLine($"Zip file created: {zipFileName}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in ZipFiles(): {ex.Message}");
+                LogOperation("N/A", "Failure", ex.Message);
             }
         }
-    }
 
-    Dts.TaskResult = (int)ScriptResults.Success;
-}
-
-private void ProcessFileTransfer(SqlDataReader reader)
-{
-    string payor = reader["Payor"].ToString();
-    int step = Convert.ToInt32(reader["Step"]);
-    string sourcePath = reader["SourcePath"].ToString();
-    string destinationPath = reader["DestinationPath"].ToString();
-    string filePattern = reader["FilePattern"].ToString();
-    string actionType = reader["ActionType"].ToString();
-    bool isBatch = Convert.ToBoolean(reader["IsBatch"]);
-    string batchFileName = reader["BatchFileName"] as string;
-    bool removeExtension = Convert.ToBoolean(reader["RemoveExtension"]);
-    string newFileName = reader["NewFileName"] as string;
-    string archiveSubFolder = reader["ArchiveSubFolder"] as string;
-
-    if (!Directory.Exists(sourcePath))
-    {
-        LogFileTransfer(sourcePath, destinationPath, filePattern, actionType, "Failed", "Source directory does not exist.");
-        return;
-    }
-
-    string[] files = Directory.GetFiles(sourcePath, filePattern);
-    if (files.Length == 0)
-    {
-        LogFileTransfer(sourcePath, destinationPath, filePattern, actionType, "No Files Found", "");
-        return;
-    }
-
-    // Apply exclusion patterns
-    List<string> exclusionPatterns = new List<string>();
-    if (!reader.IsDBNull(reader.GetOrdinal("ExclusionPattern")))
-    {
-        exclusionPatterns.Add(reader["ExclusionPattern"].ToString());
-    }
-
-    files = Array.FindAll(files, file =>
-    {
-        foreach (string pattern in exclusionPatterns)
+        // Core File Processing Function
+        private void ProcessFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, bool isMove)
         {
-            if (file.IndexOf(pattern, StringComparison.OrdinalIgnoreCase) >= 0)
-                return false;
-        }
-        return true;
-    });
-
-    if (files.Length == 0)
-    {
-        LogFileTransfer(sourcePath, destinationPath, filePattern, actionType, "No Files Found After Filtering", "");
-        return;
-    }
-
-    EnsureDirectoryExists(destinationPath);
-    if (!string.IsNullOrEmpty(archiveSubFolder))
-    {
-        destinationPath = Path.Combine(destinationPath, archiveSubFolder);
-        EnsureDirectoryExists(destinationPath);
-    }
-
-    try
-    {
-        if (isBatch && actionType == "Zip")
-        {
-            BatchZipOperation(destinationPath, batchFileName, files);
-        }
-        else
-        {
-            foreach (string file in files)
+            try
             {
-                HandleFileOperation(file, destinationPath, actionType, removeExtension, newFileName);
+                if (!Directory.Exists(sourceFolder))
+                    throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
+
+                if (!Directory.Exists(destinationFolder))
+                    throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
+                    //Directory.CreateDirectory(destinationFolder);
+
+                // Convert exclusion list into an array
+                string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+
+                // Get matching files
+                string[] files = Directory.GetFiles(sourceFolder, filePattern);
+
+                foreach (string file in files)
+                {
+                    string fileName = Path.GetFileName(file);
+
+                    // Check Exclusion List
+                    if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
+                    {
+                        Console.WriteLine($"Excluded file: {fileName}");
+                        LogOperation(fileName, "Excluded", "File excluded based on exclusion list.");
+                        continue;
+                    }
+
+                    string destinationFile = Path.Combine(destinationFolder, fileName);
+
+                    try
+                    {
+                        if (isMove)
+                        {
+                            File.Move(file, destinationFile);
+                            Console.WriteLine($"Moved: {fileName}");
+                            LogOperation(fileName, "Success", "File moved successfully.");
+                        }
+                        else
+                        {
+                            File.Copy(file, destinationFile, true);
+                            Console.WriteLine($"Copied: {fileName}");
+                            LogOperation(fileName, "Success", "File moved successfully.");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Error processing file: {fileName}. Error: {ex.Message}");
+                        LogOperation(fileName, "Failure", ex.Message);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in ProcessFiles(): {ex.Message}");
+                LogOperation("N.A", "Failure", ex.Message);
             }
         }
-        LogFileTransfer(sourcePath, destinationPath, batchFileName ?? filePattern, actionType, "Success", "");
-    }
-    catch (Exception ex)
-    {
-        LogFileTransfer(sourcePath, destinationPath, batchFileName ?? filePattern, actionType, "Failed", ex.Message);
-    }
-}
 
-private void BatchZipOperation(string destinationPath, string batchFileName, string[] files)
-{
-    string zipFilePath = Path.Combine(destinationPath, batchFileName);
-    using (ZipArchive zip = ZipFile.Open(zipFilePath, ZipArchiveMode.Create))
-    {
-        foreach (string file in files)
+        private void LogOperation(string fileName, string status, string logMessage)
         {
-            zip.CreateEntryFromFile(file, Path.GetFileName(file), CompressionLevel.Optimal);
-        }
-    }
-}
-
-private void HandleFileOperation(string file, string destinationPath, string actionType, bool removeExtension, string newFileName)
-{
-    string fileName = Path.GetFileName(file);
-    string destinationFile = Path.Combine(destinationPath, fileName);
-
-    if (removeExtension)
-    {
-        destinationFile = Path.Combine(destinationPath, Path.GetFileNameWithoutExtension(file));
-    }
-    else if (!string.IsNullOrEmpty(newFileName))
-    {
-        destinationFile = Path.Combine(destinationPath, newFileName);
-    }
-
-    switch (actionType)
-    {
-        case "Move":
-            if (File.Exists(destinationFile)) throw new Exception("File already exists in destination.");
-            File.Move(file, destinationFile);
-            break;
-        case "Copy":
-            if (!File.Exists(destinationFile)) File.Copy(file, destinationFile);
-            break;
-        case "Zip":
-            string zipFile = destinationFile + ".zip";
-            using (ZipArchive zip = ZipFile.Open(zipFile, ZipArchiveMode.Create))
+            try
             {
-                zip.CreateEntryFromFile(file, fileName, CompressionLevel.Optimal);
+                int mappingID = Convert.ToInt32(Dts.Variables["User::MappingID"].Value);
+                string actionType = Dts.Variables["User::ActionType"].Value.ToString();
+
+                Dts.Variables["User::LogMappingID"].Value = mappingID;
+                Dts.Variables["User::LogActionType"].Value = actionType;
+                Dts.Variables["User::LogFileName"].Value = fileName;
+                Dts.Variables["User::LogStatus"].Value = status;
+                Dts.Variables["User::LogMessage"].Value = logMessage;
+
+                Console.WriteLine($"Log Captured - MappingID: {mappingID}, FileName: {fileName}, Status: {status}, Message: {logMessage}");
             }
-            break;
-        case "Unzip":
-            ZipFile.ExtractToDirectory(file, destinationPath);
-            break;
-        case "Rename":
-            if (File.Exists(destinationFile)) throw new Exception("Renamed file already exists in destination.");
-            File.Move(file, destinationFile);
-            break;
-    }
-
-    ArchiveFile(destinationPath, destinationFile);
-}
-
-private void ArchiveFile(string destinationPath, string destinationFile)
-{
-    string archivePath = Path.Combine(destinationPath, DateTime.Now.ToString("yyyyMM"));
-    EnsureDirectoryExists(archivePath);
-    string archiveFile = Path.Combine(archivePath, Path.GetFileName(destinationFile));
-
-    if (File.Exists(archiveFile)) File.Delete(archiveFile);
-    File.Move(destinationFile, archiveFile);
-}
-
-private void EnsureDirectoryExists(string path)
-{
-    if (!Directory.Exists(path)) Directory.CreateDirectory(path);
-}
-
-private void LogFileTransfer(string sourcePath, string destinationPath, string fileName, string actionType, string status, string errorMessage)
-{
-    string logQuery = @"INSERT INTO FileTransferLog (SourcePath, DestinationPath, FileName, ActionType, TransferTime, Status, ErrorMessage)
-                        VALUES (@SourcePath, @DestinationPath, @FileName, @ActionType, GETDATE(), @Status, @ErrorMessage)";
-
-    using (SqlConnection conn = new SqlConnection(connectionString))
-    {
-        conn.Open();
-        using (SqlCommand logCmd = new SqlCommand(logQuery, conn))
-        {
-            logCmd.Parameters.AddWithValue("@SourcePath", sourcePath);
-            logCmd.Parameters.AddWithValue("@DestinationPath", destinationPath);
-            logCmd.Parameters.AddWithValue("@FileName", fileName);
-            logCmd.Parameters.AddWithValue("@ActionType", actionType);
-            logCmd.Parameters.AddWithValue("@Status", status);
-            logCmd.Parameters.AddWithValue("@ErrorMessage", errorMessage);
-            logCmd.ExecuteNonQuery();
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error while logging: {ex.Message}");
+            }
         }
-    }
+        #region ScriptResults declaration
+        /// <summary>
+        /// This enum provides a convenient shorthand within the scope of this class for setting the
+        /// result of the script.
+        /// 
+        /// This code was generated automatically.
+        /// </summary>
+        enum ScriptResults
+        {
+            Success = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Success,
+            Failure = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Failure
+        };
+        #endregion
+
+	}
 }
