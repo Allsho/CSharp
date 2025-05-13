@@ -1,211 +1,240 @@
 using System;
-using System.Collections.Generic;
 using System.Data;
-using System.Data.SqlClient;
 using System.IO;
 using System.Linq;
-using System.Net;
-using System.Net.Mail;
-using System.Security;
+using Microsoft.Data.SqlClient;
+using OfficeOpenXml;
+using System.Collections.Generic;
+using System.Reflection.Metadata.Ecma335;
+using Microsoft.Extensions.FileSystemGlobbing;
 
-namespace FileIngestion
+class Program
 {
-    class DataMapping
+    static string connectionString = "Server=;Database=ClaimsStage;Integrated Security=True;";
+
+    static void Main()
     {
-        public string IncomingColumnName { get; set; }
-        public string StagingTableName { get; set; }
-        public string ExpectedDelimiter { get; set; }
-        public bool IsRequired { get; set; }
+        try
+        {
+            Log("ETL Process Started");
+            List<TableMapping> mappings = GetTableMappings();
+
+            foreach (var mapping in mappings)
+            {
+                List<ColumnMapping> columnMappings = GetColumnMappings(mapping.TargetTable);
+                ProcessFiles(mapping, columnMappings);
+            }
+
+            Log("ETL Process Compeleted");
+        }
+        catch (Exception ex)
+        {
+            LogError("General Error", ex.Message);
+        }
     }
 
-    class Program
+    static List<TableMapping> GetTableMappings()
     {
-        static string connectionString = Environment.GetEnvironmentVariable("DB_CONNECTION_STRING");
-        static string emailSender = Environment.GetEnvironmentVariable("EMAIL_SENDER");
-        static string emailRecipient = Environment.GetEnvironmentVariable("EMAIL_RECIPIENT");
-        static SecureString emailPassword = ConvertToSecureString(Environment.GetEnvironmentVariable("EMAIL_PASSWORD"));
-        static string folderPath = "your_folder_path"; // Update this path as needed
-
-        static void Main(string[] args)
+        List<TableMapping> mappings = new List<TableMapping>();
+        using (SqlConnection conn = new SqlConnection(connectionString))
         {
-            string[] fileEntries = Directory.GetFiles(folderPath, "*.csv").Union(Directory.GetFiles(folderPath, "*.txt")).ToArray();
-
-            List<DataMapping> dataMappings = LoadDataMappings();
-
-            foreach (string filePath in fileEntries)
+            conn.Open();
+            string query = @"
+                SELECT TargetTable, FilePattern, SheetName, FileType, SourcePath, ArchivePath, Delimiter
+                FROM ETL.Table_Mapping";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            using (SqlDataReader reader = cmd.ExecuteReader())
             {
-                ProcessFile(filePath, dataMappings);
-            }
-        }
-
-        static void ProcessFile(string filePath, List<DataMapping> dataMappings)
-        {
-            string fileName = Path.GetFileNameWithoutExtension(filePath);
-            string fileDate = fileName.Substring(fileName.Length - 8); // Assuming MMDDYYYY format
-
-            List<string> unmatchedColumns = new List<string>();
-
-            try
-            {
-                using (StreamReader reader = new StreamReader(filePath))
+                while (reader.Read())
                 {
-                    string headerLine = reader.ReadLine();
-                    if (headerLine == null)
+                    mappings.Add(new TableMapping
                     {
-                        // Handle empty file
-                        return;
-                    }
-
-                    string[] headerColumns = headerLine.Split(',');
-
-                    using (SqlConnection connection = new SqlConnection(connectionString))
-                    {
-                        connection.Open();
-
-                        Dictionary<string, string> columnMapping = MapColumns(headerColumns, dataMappings, unmatchedColumns);
-
-                        while (!reader.EndOfStream)
-                        {
-                            string dataLine = reader.ReadLine();
-                            string[] dataColumns = dataLine.Split(',');
-
-                            InsertDataIntoStagingTable(connection, columnMapping, headerColumns, dataColumns);
-                        }
-                    }
+                        TargetTable = reader["TargetTable"].ToString(),
+                        FilePattern = reader["FilePattern"].ToString(),
+                        SheetName = reader["SheetName"].ToString(),
+                        FileType = reader["FileType"].ToString(),
+                        SourcePath = reader["SourcePath"].ToString(),
+                        ArchivePath = reader["ArchivePath"].ToString(),
+                        Delimiter = reader["Delimiter"].ToString()
+                    });
                 }
-            }
-            catch (IOException ioEx)
-            {
-                LogError($"File Error: {ioEx.Message}");
-            }
-            catch (Exception ex)
-            {
-                LogError($"Error: {ex.Message}");
-            }
-
-            if (unmatchedColumns.Count > 0)
-            {
-                SendEmailWithUnmatchedColumns(unmatchedColumns);
             }
         }
+        return mappings;
+    }
 
-        static Dictionary<string, string> MapColumns(string[] headerColumns, List<DataMapping> dataMappings, List<string> unmatchedColumns)
+    static List<ColumnMapping> GetColumnMappings(string targetTable)
+    {
+
+        List<ColumnMapping> columnMappings = new List<ColumnMapping>();
+        using (SqlConnection conn = new SqlConnection(connectionString))
         {
-            Dictionary<string, string> columnMapping = new Dictionary<string, string>();
-
-            foreach (var dataMapping in dataMappings)
+            conn.Open();
+            string query = @"
+                SELECT cdm.IncomingColumnName AS IncomingColumn, cdm.StandardizedColumnName AS TargetColumn
+                FROM ETL.Claim_Data_Mapping cdm
+                JOIN ETL.Table_Mapping tm ON cdm.PayorName = tm.PayorName AND cdm.IncomingColumnName IS NOT NULL
+                WHERE tm.TargetTable = @TargetTable";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
             {
-                string incomingColumnName = dataMapping.IncomingColumnName;
-                string stagingTableName = dataMapping.StagingTableName;
-                bool isRequired = dataMapping.IsRequired;
-
-                if (headerColumns.Contains(incomingColumnName, StringComparer.OrdinalIgnoreCase))
-                {
-                    // Map incoming column to staging column
-                    columnMapping.Add(incomingColumnName, stagingTableName);
-                }
-                else if (isRequired)
-                {
-                    // Handle a required column missing in the incoming data
-                    unmatchedColumns.Add(incomingColumnName);
-                }
-                // If the column is not required and missing, continue with the processing
-            }
-
-            return columnMapping;
-        }
-
-        static void InsertDataIntoStagingTable(SqlConnection connection, Dictionary<string, string> columnMapping, string[] headerColumns, string[] dataColumns)
-        {
-            using (SqlCommand insertCommand = new SqlCommand())
-            {
-                insertCommand.Connection = connection;
-                foreach (var kvp in columnMapping)
-                {
-                    string incomingColumn = kvp.Key;
-                    string stagingColumn = kvp.Value;
-
-                    if (headerColumns.Contains(incomingColumn, StringComparer.OrdinalIgnoreCase))
-                    {
-                        int columnIndex = Array.IndexOf(headerColumns, incomingColumn);
-                        if (columnIndex >= 0 && columnIndex < dataColumns.Length)
-                        {
-                            string columnValue = dataColumns[columnIndex];
-                            insertCommand.Parameters.AddWithValue($"@{stagingColumn}", columnValue);
-                        }
-                    }
-                }
-
-                insertCommand.CommandText = $"INSERT INTO {string.Join(", ", columnMapping.Values)} " +
-                                        $"VALUES ({string.Join(", ", columnMapping.Keys.Select(key => $"@{key}"))})";
-                insertCommand.ExecuteNonQuery();
-                insertCommand.Parameters.Clear();
-            }
-        }
-
-        static List<DataMapping> LoadDataMappings()
-        {
-            List<DataMapping> dataMappings = new List<DataMapping>();
-
-            using (SqlConnection connection = new SqlConnection(connectionString))
-            {
-                connection.Open();
-
-                using (SqlCommand command = new SqlCommand("SELECT IncomingColumnName, StagingTableName, ExpectedDelimiter, IsRequired FROM Data_Mapping", connection))
-                using (SqlDataReader reader = command.ExecuteReader())
+                cmd.Parameters.AddWithValue("@TargetTable", targetTable);
+                using (SqlDataReader reader = cmd.ExecuteReader())
                 {
                     while (reader.Read())
                     {
-                        DataMapping dataMapping = new DataMapping
+                        columnMappings.Add(new ColumnMapping
                         {
-                            IncomingColumnName = reader.GetString(0),
-                            StagingTableName = reader.GetString(1),
-                            ExpectedDelimiter = reader.GetString(2),
-                            IsRequired = reader.GetBoolean(3)
-                        };
-
-                        dataMappings.Add(dataMapping);
+                            IncomingColumn = reader["IncomingColumn"].ToString(),
+                            TargetColumn = reader["TargetColumn"].ToString()
+                        });
                     }
                 }
             }
-
-            return dataMappings;
         }
+        return columnMappings;
+    }
 
-        static void SendEmailWithUnmatchedColumns(List<string> unmatchedColumns)
+    static void ProcessFiles(TableMapping mapping, List<ColumnMapping> columnMappings)
+    {
+        string[] files = Directory.GetFiles(mapping.SourcePath, mapping.FilePattern);
+        foreach (var file in files)
         {
             try
             {
-                using (SmtpClient smtpClient = new SmtpClient("smtp.gmail.com"))
-                {
-                    smtpClient.UseDefaultCredentials = false;
-                    smtpClient.Credentials = new NetworkCredential(emailSender, emailPassword);
-                    smtpClient.EnableSsl = true;
-                    smtpClient.Port = 587;
-
-                    using (MailMessage mailMessage = new MailMessage(emailSender, emailRecipient))
-                    {
-                        mailMessage.Subject = "Unmatched Columns in Incoming File";
-                        mailMessage.Body = "The following columns were not found in the data mapping table:\n\n";
-                        foreach (var column in unmatchedColumns)
-                        {
-                            mailMessage.Body += $"{column}\n";
-                        }
-
-                        smtpClient.Send(mailMessage);
-                    }
-                }
+                Log($"Processing: {file}");
+                DataTable data = mapping.FileType.ToLower() == "excel" ? ReadExcel(file, mapping.SheetName) : ReadCsv(file, mapping.Delimiter);
+                MapColumns(data, columnMappings);
+                BulkInsert(data, mapping.TargetTable);
+                ArchiveFile(file, mapping.ArchivePath);
             }
             catch (Exception ex)
             {
-                LogError($"Error sending email: {ex.Message}");
+                LogError($"Error processing {file}", ex.Message);
             }
         }
+    }
 
-        static void LogError(string errorMessage)
+    static void MapColumns(DataTable data, List<ColumnMapping> columnMappings)
+    {
+        foreach (var mapping in columnMappings)
         {
-            // You can implement a logging mechanism here, e.g., write to a log file.
-            Console.WriteLine(errorMessage);
+            if (data.Columns.Contains(mapping.IncomingColumn))
+            {
+                data.Columns[mapping.IncomingColumn].ColumnName = mapping.TargetColumn;
+            }
         }
     }
+
+    static DataTable ReadCsv(string filePath, string delimiter)
+    {
+        DataTable dt = new DataTable();
+        using (StreamReader sr = new StreamReader(filePath))
+        {
+            string[] headers = sr.ReadLine().Split(delimiter.ToCharArray());
+            foreach (string header in headers)
+                dt.Columns.Add(header);
+
+        while (!sr.EndOfStream)
+            {
+                dt.Rows.Add(sr.ReadLine().Split(delimiter.ToCharArray()));
+            }
+        }
+        return dt;
+    }
+
+    static DataTable ReadExcel(string filePath, string sheetName)
+    {
+        DataTable dt = new DataTable();
+        using (ExcelPackage package = new ExcelPackage(new FileInfo(filePath)))
+        {
+            ExcelWorksheet worksheet = package.Workbook.Worksheets.FirstOrDefault(ws => ws.Name == sheetName);
+            if (worksheet != null)
+                throw new Exception($"Sheet '{sheetName}' not found in file {filePath}");
+
+            for (int col = 1; col <= worksheet.Dimension.Columns; col++)
+                dt.Columns.Add(worksheet.Cells[1, col].Value.ToString());
+
+            for (int row = 2; row <= worksheet.Dimension.Rows; row++)
+            {
+                DataRow dr = dt.NewRow();
+                for (int col = 1; col <= worksheet.Dimension.Columns; col++)
+                    dr[col - 1] = worksheet.Cells[row, col].Value?.ToString() ?? "";
+                dt.Rows.Add(dr);
+            }
+        }
+        return dt;
+    }
+
+    static void BulkInsert(DataTable data, string tableName)
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlBulkCopy bulkCopy = new SqlBulkCopy(conn))
+            {
+                bulkCopy.DestinationTableName = tableName;
+                bulkCopy.WriteToServer(data);
+            }
+        }
+    }
+
+    static void ArchiveFile(string filePath, string archivePath)
+    {
+        string destPath = Path.Combine(archivePath, Path.GetFileName(filePath));
+        File.Move(filePath, destPath);
+        Log($"Archived: {filePath} -> {destPath}");
+    }
+
+    static void Log(string message)
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL_Log (Timestamp, Message) VALUES (@Timestamp, @Message)", conn))
+            {
+                cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+                cmd.Parameters.AddWithValue("@Message", message);
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+
+    static void LogError(string errorType, string message)
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL_ErrorLog (Timestamp, ErrorType, Message) VALUES (@Timestamp, @ErrorType, @Message)", conn))
+            {
+                cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+                cmd.Parameters.AddWithValue("@ErrorType", errorType);
+                cmd.Parameters.AddWithValue("@Message", message);
+                cmd.ExecuteNonQuery();
+            }
+        }
+    }
+}
+
+class TableMapping
+{
+    public string? FilePattern { get; set; }
+    
+    public string? TargetTable { get; set; }
+
+    public string? SheetName { get; set; }
+
+    public string? FileType { get; set; }
+
+    public string? SourcePath { get; set; }
+
+    public string? ArchivePath { get; set; }
+
+    public string? Delimiter { get; set; }
+}
+
+class ColumnMapping
+{
+    public string? IncomingColumn { get; set; }
+    
+    public string? TargetColumn { get; set; }
 }
