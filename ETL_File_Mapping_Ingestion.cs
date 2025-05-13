@@ -5,236 +5,231 @@ using System.Linq;
 using Microsoft.Data.SqlClient;
 using OfficeOpenXml;
 using System.Collections.Generic;
-using System.Reflection.Metadata.Ecma335;
-using Microsoft.Extensions.FileSystemGlobbing;
+using Microsoft.SqlServer.Dts.Runtime;
 
-class Program
+public void Main()
 {
-    static string connectionString = "Server=;Database=ClaimsStage;Integrated Security=True;";
+    string connectionString = "Server=;Database=ClaimsStage;Integrated Security=True;";
 
-    static void Main()
+    try
     {
-        try
+        Log("ETL Process Started", connectionString);
+        List<TableMapping> mappings = GetTableMappings(connectionString);
+
+        foreach (var mapping in mappings)
         {
-            Log("ETL Process Started");
-            List<TableMapping> mappings = GetTableMappings();
-
-            foreach (var mapping in mappings)
-            {
-                List<ColumnMapping> columnMappings = GetColumnMappings(mapping.TargetTable);
-                ProcessFiles(mapping, columnMappings);
-            }
-
-            Log("ETL Process Compeleted");
+            List<ColumnMapping> columnMappings = GetColumnMappings(mapping.TargetTable, connectionString);
+            ProcessFiles(mapping, columnMappings, connectionString);
         }
-        catch (Exception ex)
+
+        Log("ETL Process Completed", connectionString);
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+    catch (Exception ex)
+    {
+        LogError("General Error", ex.Message, connectionString);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+    }
+}
+
+public class TableMapping
+{
+    public string FilePattern { get; set; }
+    public string TargetTable { get; set; }
+    public string SheetName { get; set; }
+    public string FileType { get; set; }
+    public string SourcePath { get; set; }
+    public string ArchivePath { get; set; }
+    public string Delimiter { get; set; }
+}
+
+public class ColumnMapping
+{
+    public string IncomingColumn { get; set; }
+    public string TargetColumn { get; set; }
+}
+
+private List<TableMapping> GetTableMappings(string connectionString)
+{
+    var mappings = new List<TableMapping>();
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        string query = @"SELECT TargetTable, FilePattern, SheetName, FileType, SourcePath, ArchivePath, Delimiter FROM ETL.Table_Mapping";
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
         {
-            LogError("General Error", ex.Message);
+            while (reader.Read())
+            {
+                mappings.Add(new TableMapping
+                {
+                    TargetTable = reader["TargetTable"].ToString(),
+                    FilePattern = reader["FilePattern"].ToString(),
+                    SheetName = reader["SheetName"].ToString(),
+                    FileType = reader["FileType"].ToString(),
+                    SourcePath = reader["SourcePath"].ToString(),
+                    ArchivePath = reader["ArchivePath"].ToString(),
+                    Delimiter = reader["Delimiter"].ToString()
+                });
+            }
         }
     }
+    return mappings;
+}
 
-    static List<TableMapping> GetTableMappings()
+private List<ColumnMapping> GetColumnMappings(string targetTable, string connectionString)
+{
+    var columnMappings = new List<ColumnMapping>();
+    using (SqlConnection conn = new SqlConnection(connectionString))
     {
-        List<TableMapping> mappings = new List<TableMapping>();
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        conn.Open();
+        string query = @"
+            SELECT cdm.IncomingColumnName AS IncomingColumn, cdm.StandardizedColumnName AS TargetColumn
+            FROM ETL.Claim_Data_Mapping cdm
+            JOIN ETL.Table_Mapping tm ON cdm.PayorName = tm.PayorName AND cdm.IncomingColumnName IS NOT NULL
+            WHERE tm.TargetTable = @TargetTable";
+        using (SqlCommand cmd = new SqlCommand(query, conn))
         {
-            conn.Open();
-            string query = @"
-                SELECT TargetTable, FilePattern, SheetName, FileType, SourcePath, ArchivePath, Delimiter
-                FROM ETL.Table_Mapping";
-            using (SqlCommand cmd = new SqlCommand(query, conn))
+            cmd.Parameters.AddWithValue("@TargetTable", targetTable);
             using (SqlDataReader reader = cmd.ExecuteReader())
             {
                 while (reader.Read())
                 {
-                    mappings.Add(new TableMapping
+                    columnMappings.Add(new ColumnMapping
                     {
-                        TargetTable = reader["TargetTable"].ToString(),
-                        FilePattern = reader["FilePattern"].ToString(),
-                        SheetName = reader["SheetName"].ToString(),
-                        FileType = reader["FileType"].ToString(),
-                        SourcePath = reader["SourcePath"].ToString(),
-                        ArchivePath = reader["ArchivePath"].ToString(),
-                        Delimiter = reader["Delimiter"].ToString()
+                        IncomingColumn = reader["IncomingColumn"].ToString(),
+                        TargetColumn = reader["TargetColumn"].ToString()
                     });
                 }
             }
         }
-        return mappings;
     }
+    return columnMappings;
+}
 
-    static List<ColumnMapping> GetColumnMappings(string targetTable)
+private void ProcessFiles(TableMapping mapping, List<ColumnMapping> columnMappings, string connectionString)
+{
+    string[] files = Directory.GetFiles(mapping.SourcePath, mapping.FilePattern);
+    foreach (var file in files)
     {
-
-        List<ColumnMapping> columnMappings = new List<ColumnMapping>();
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        try
         {
-            conn.Open();
-            string query = @"
-                SELECT cdm.IncomingColumnName AS IncomingColumn, cdm.StandardizedColumnName AS TargetColumn
-                FROM ETL.Claim_Data_Mapping cdm
-                JOIN ETL.Table_Mapping tm ON cdm.PayorName = tm.PayorName AND cdm.IncomingColumnName IS NOT NULL
-                WHERE tm.TargetTable = @TargetTable";
-            using (SqlCommand cmd = new SqlCommand(query, conn))
-            {
-                cmd.Parameters.AddWithValue("@TargetTable", targetTable);
-                using (SqlDataReader reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        columnMappings.Add(new ColumnMapping
-                        {
-                            IncomingColumn = reader["IncomingColumn"].ToString(),
-                            TargetColumn = reader["TargetColumn"].ToString()
-                        });
-                    }
-                }
-            }
+            Log($"Processing: {file}", connectionString);
+            DataTable data = mapping.FileType.ToLower() == "excel" ? ReadExcel(file, mapping.SheetName) : ReadCsv(file, mapping.Delimiter);
+            MapColumns(data, columnMappings);
+            BulkInsert(data, mapping.TargetTable, connectionString);
+            ArchiveFile(file, mapping.ArchivePath, connectionString);
         }
-        return columnMappings;
-    }
-
-    static void ProcessFiles(TableMapping mapping, List<ColumnMapping> columnMappings)
-    {
-        string[] files = Directory.GetFiles(mapping.SourcePath, mapping.FilePattern);
-        foreach (var file in files)
+        catch (Exception ex)
         {
-            try
-            {
-                Log($"Processing: {file}");
-                DataTable data = mapping.FileType.ToLower() == "excel" ? ReadExcel(file, mapping.SheetName) : ReadCsv(file, mapping.Delimiter);
-                MapColumns(data, columnMappings);
-                BulkInsert(data, mapping.TargetTable);
-                ArchiveFile(file, mapping.ArchivePath);
-            }
-            catch (Exception ex)
-            {
-                LogError($"Error processing {file}", ex.Message);
-            }
+            LogError($"Error processing {file}", ex.Message, connectionString);
         }
     }
+}
 
-    static void MapColumns(DataTable data, List<ColumnMapping> columnMappings)
+private void MapColumns(DataTable data, List<ColumnMapping> columnMappings)
+{
+    foreach (var mapping in columnMappings)
     {
-        foreach (var mapping in columnMappings)
+        if (data.Columns.Contains(mapping.IncomingColumn))
         {
-            if (data.Columns.Contains(mapping.IncomingColumn))
-            {
-                data.Columns[mapping.IncomingColumn].ColumnName = mapping.TargetColumn;
-            }
+            data.Columns[mapping.IncomingColumn].ColumnName = mapping.TargetColumn;
         }
     }
+}
 
-    static DataTable ReadCsv(string filePath, string delimiter)
+private DataTable ReadCsv(string filePath, string delimiter)
+{
+    DataTable dt = new DataTable();
+    using (StreamReader sr = new StreamReader(filePath))
     {
-        DataTable dt = new DataTable();
-        using (StreamReader sr = new StreamReader(filePath))
-        {
-            string[] headers = sr.ReadLine().Split(delimiter.ToCharArray());
-            foreach (string header in headers)
-                dt.Columns.Add(header);
+        string[] headers = sr.ReadLine().Split(delimiter.ToCharArray());
+        foreach (string header in headers)
+            dt.Columns.Add(header);
 
         while (!sr.EndOfStream)
-            {
-                dt.Rows.Add(sr.ReadLine().Split(delimiter.ToCharArray()));
-            }
-        }
-        return dt;
-    }
-
-    static DataTable ReadExcel(string filePath, string sheetName)
-    {
-        DataTable dt = new DataTable();
-        using (ExcelPackage package = new ExcelPackage(new FileInfo(filePath)))
         {
-            ExcelWorksheet worksheet = package.Workbook.Worksheets.FirstOrDefault(ws => ws.Name == sheetName);
-            if (worksheet != null)
-                throw new Exception($"Sheet '{sheetName}' not found in file {filePath}");
+            dt.Rows.Add(sr.ReadLine().Split(delimiter.ToCharArray()));
+        }
+    }
+    return dt;
+}
 
+private DataTable ReadExcel(string filePath, string sheetName)
+{
+    DataTable dt = new DataTable();
+    ExcelPackage.LicenseContext = LicenseContext.NonCommercial;
+    using (ExcelPackage package = new ExcelPackage(new FileInfo(filePath)))
+    {
+        ExcelWorksheet worksheet = package.Workbook.Worksheets.FirstOrDefault(ws => ws.Name == sheetName);
+        if (worksheet == null)
+            throw new Exception($"Sheet '{sheetName}' not found in file {filePath}");
+
+        for (int col = 1; col <= worksheet.Dimension.Columns; col++)
+            dt.Columns.Add(worksheet.Cells[1, col].Value?.ToString() ?? $"Column{col}");
+
+        for (int row = 2; row <= worksheet.Dimension.Rows; row++)
+        {
+            DataRow dr = dt.NewRow();
             for (int col = 1; col <= worksheet.Dimension.Columns; col++)
-                dt.Columns.Add(worksheet.Cells[1, col].Value.ToString());
-
-            for (int row = 2; row <= worksheet.Dimension.Rows; row++)
-            {
-                DataRow dr = dt.NewRow();
-                for (int col = 1; col <= worksheet.Dimension.Columns; col++)
-                    dr[col - 1] = worksheet.Cells[row, col].Value?.ToString() ?? "";
-                dt.Rows.Add(dr);
-            }
-        }
-        return dt;
-    }
-
-    static void BulkInsert(DataTable data, string tableName)
-    {
-        using (SqlConnection conn = new SqlConnection(connectionString))
-        {
-            conn.Open();
-            using (SqlBulkCopy bulkCopy = new SqlBulkCopy(conn))
-            {
-                bulkCopy.DestinationTableName = tableName;
-                bulkCopy.WriteToServer(data);
-            }
+                dr[col - 1] = worksheet.Cells[row, col].Value?.ToString() ?? "";
+            dt.Rows.Add(dr);
         }
     }
+    return dt;
+}
 
-    static void ArchiveFile(string filePath, string archivePath)
+private void BulkInsert(DataTable data, string tableName, string connectionString)
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
     {
-        string destPath = Path.Combine(archivePath, Path.GetFileName(filePath));
-        File.Move(filePath, destPath);
-        Log($"Archived: {filePath} -> {destPath}");
-    }
-
-    static void Log(string message)
-    {
-        using (SqlConnection conn = new SqlConnection(connectionString))
+        conn.Open();
+        using (SqlBulkCopy bulkCopy = new SqlBulkCopy(conn))
         {
-            conn.Open();
-            using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL_Log (Timestamp, Message) VALUES (@Timestamp, @Message)", conn))
-            {
-                cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
-                cmd.Parameters.AddWithValue("@Message", message);
-                cmd.ExecuteNonQuery();
-            }
-        }
-    }
-
-    static void LogError(string errorType, string message)
-    {
-        using (SqlConnection conn = new SqlConnection(connectionString))
-        {
-            conn.Open();
-            using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL_ErrorLog (Timestamp, ErrorType, Message) VALUES (@Timestamp, @ErrorType, @Message)", conn))
-            {
-                cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
-                cmd.Parameters.AddWithValue("@ErrorType", errorType);
-                cmd.Parameters.AddWithValue("@Message", message);
-                cmd.ExecuteNonQuery();
-            }
+            bulkCopy.DestinationTableName = tableName;
+            bulkCopy.WriteToServer(data);
         }
     }
 }
 
-class TableMapping
+private void ArchiveFile(string filePath, string archivePath, string connectionString)
 {
-    public string? FilePattern { get; set; }
-    
-    public string? TargetTable { get; set; }
-
-    public string? SheetName { get; set; }
-
-    public string? FileType { get; set; }
-
-    public string? SourcePath { get; set; }
-
-    public string? ArchivePath { get; set; }
-
-    public string? Delimiter { get; set; }
+    string destPath = Path.Combine(archivePath, Path.GetFileName(filePath));
+    File.Move(filePath, destPath);
+    Log($"Archived: {filePath} -> {destPath}", connectionString);
 }
 
-class ColumnMapping
+private void Log(string message, string connectionString)
 {
-    public string? IncomingColumn { get; set; }
-    
-    public string? TargetColumn { get; set; }
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL_Log (Timestamp, Message) VALUES (@Timestamp, @Message)", conn))
+        {
+            cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+            cmd.Parameters.AddWithValue("@Message", message);
+            cmd.ExecuteNonQuery();
+        }
+    }
+}
+
+private void LogError(string errorType, string message, string connectionString)
+{
+    using (SqlConnection conn = new SqlConnection(connectionString))
+    {
+        conn.Open();
+        using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL_ErrorLog (Timestamp, ErrorType, Message) VALUES (@Timestamp, @ErrorType, @Message)", conn))
+        {
+            cmd.Parameters.AddWithValue("@Timestamp", DateTime.Now);
+            cmd.Parameters.AddWithValue("@ErrorType", errorType);
+            cmd.Parameters.AddWithValue("@Message", message);
+            cmd.ExecuteNonQuery();
+        }
+    }
+}
+
+enum ScriptResults
+{
+    Success = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Success,
+    Failure = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Failure
 }
