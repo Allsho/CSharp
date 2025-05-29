@@ -1,0 +1,232 @@
+public void Main()
+{
+	// Variables passed from SSIS
+    string mappingID = Dts.Variables["User::MappingID"].Value.ToString();
+    string actionType = Dts.Variables["User::ActionType"].Value.ToString();
+    string sourceFolder = Dts.Variables["User::SourceFolder"].Value.ToString();
+    string destinationFolder = Dts.Variables["User::DestinationFolder"].Value.ToString();
+    string filePattern = Dts.Variables["User::FilePattern"].Value.ToString();
+    string exclusionList = Dts.Variables["User::ExclusionList"].Value.ToString();
+    string zipName = Dts.Variables["User::ZipName"].Value.ToString();
+
+    // Grouping logic
+    string payerName = Dts.Variables["User::PayerName"].Value.ToString();
+    int sequence = Convert.ToInt32(Dts.Variables["User::Sequence"].Value);
+
+    // Static vairables
+    string currentPayer = Dts.Variables["User::CurrentPayer"].Value.ToString();
+    bool hasFiles = (bool)Dts.Variables["User::HasFiles"].Value;
+
+    try
+    {
+        if (sequence == 1)
+        {
+            string[] matchingFiles = Directory.GetFiles(sourceFolder, filePattern)
+                .Where(file => File.GetLastWriteTime(file).Year == DateTime.Now.Year &&
+                              File.GetLastWriteTime(file).Month == DateTime.Now.Month)
+                .ToArray();
+            if (matchingFiles.Length == 0)
+            {
+                Console.WriteLine($"No files found in SourceFolder ' {sourceFolder}' for pattern '{filePattern}'. Skipping payer step.");
+                LogOperation("No Files Found", "Success", $"Skipped - No files found for {payerName}.");
+                Dts.TaskResult = (int)ScriptResults.Success;
+                return;
+            }
+            hasFiles = true;
+            Dts.Variables["User::HasFiles"].Value = true;
+            Dts.Variables["User::CurrentPayer"].Value = payerName;
+        }
+        else if (payerName != currentPayer || !hasFiles)
+        {
+            LogOperation("No Files Found", "Success", "Skipped - Seq1 had no files.");
+            Dts.TaskResult = (int)ScriptResults.Success;
+            return;
+        }
+
+        // Perform action based on ActionType
+        switch (actionType)
+        {
+            case "Move":
+                MoveFiles(sourceFolder, destinationFolder, filePattern, exclusionList);
+                break;
+
+            case "Copy":
+                CopyFiles(sourceFolder, destinationFolder, filePattern, exclusionList);
+                break;
+
+            case "Zip":
+                ZipFiles(sourceFolder, destinationFolder, filePattern, exclusionList, zipName);
+                break;
+
+            default:
+                throw new Exception("Unknown ActionType: " + actionType);
+        }
+
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error in Main(): {ex.Message}");
+        LogOperation("Error in Main()", "Failure", ex.Message);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+    }
+}
+
+// Move Files with Exclusion logic
+private void MoveFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList)
+{
+    ProcessFiles(sourceFolder, destinationFolder, filePattern, exclusionList, true);
+}
+
+// Copy Files with Exclusion Logic
+private void CopyFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList)
+{
+    ProcessFiles(sourceFolder, destinationFolder, filePattern, exclusionList, false);
+}
+
+// Zip Files and Move to Outbound
+private void ZipFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, string zipName)
+{
+    try
+    {
+        if (!Directory.Exists(sourceFolder))
+            throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
+
+        if (!Directory.Exists(destinationFolder))
+            throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
+            //Directory.CreateDirectory(destinationFolder);
+
+        // Convert exclusion list into an array
+        string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+
+        // Get all files from source folder
+        string[] files = Directory.GetFiles(sourceFolder, filePattern);
+
+        // Generate zip file name based on timestamp
+        string zipFileName = Path.Combine(destinationFolder, $"{zipName}_{DateTime.Now:yyyyMM}.zip");
+
+        // Create and write to zip file
+        using (ZipArchive archive = ZipFile.Open(zipFileName, ZipArchiveMode.Create))
+        {
+            foreach (string file in files)
+            {
+                string fileName = Path.GetFileName(file);
+
+                // Ensure the file is directly inside the source folder
+                if (!file.StartsWith(sourceFolder, StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.WriteLine($"Skipped file outside source folder: {fileName}");
+                    continue;
+                }
+
+                // Check Exclusion List using Contains
+                if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    Console.WriteLine($"Exlcuded file: {fileName}");
+                    continue;
+                }
+
+                try
+                {
+                    archive.CreateEntryFromFile(file, fileName);
+                    Console.WriteLine($"Zipped: {fileName}");
+                    LogOperation(fileName, "Success", "File compressed successfully.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error zipping file: {fileName}. Error: {ex.Message}");
+                    LogOperation(fileName, "Failure", ex.Message);
+                }
+            }
+        }
+
+        Console.WriteLine($"Zip file created: {zipFileName}");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error in ZipFiles(): {ex.Message}");
+        LogOperation("N/A", "Failure", ex.Message);
+    }
+}
+
+// Core File Processing Function
+private void ProcessFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, bool isMove)
+{
+    try
+    {
+        if (!Directory.Exists(sourceFolder))
+            throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
+
+        if (!Directory.Exists(destinationFolder))
+            throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
+            //Directory.CreateDirectory(destinationFolder);
+
+        // Convert exclusion list into an array
+        string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+
+        // Get matching files
+        string[] files = Directory.GetFiles(sourceFolder, filePattern);
+
+        foreach (string file in files)
+        {
+            string fileName = Path.GetFileName(file);
+
+            // Check Exclusion List
+            if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                Console.WriteLine($"Excluded file: {fileName}");
+                LogOperation(fileName, "Excluded", "File excluded based on exclusion list.");
+                continue;
+            }
+
+            string destinationFile = Path.Combine(destinationFolder, fileName);
+
+            try
+            {
+                if (isMove)
+                {
+                    File.Move(file, destinationFile);
+                    Console.WriteLine($"Moved: {fileName}");
+                    LogOperation(fileName, "Success", "File moved successfully.");
+                }
+                else
+                {
+                    File.Copy(file, destinationFile, true);
+                    Console.WriteLine($"Copied: {fileName}");
+                    LogOperation(fileName, "Success", "File moved successfully.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing file: {fileName}. Error: {ex.Message}");
+                LogOperation(fileName, "Failure", ex.Message);
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error in ProcessFiles(): {ex.Message}");
+        LogOperation("N.A", "Failure", ex.Message);
+    }
+}
+
+private void LogOperation(string fileName, string status, string logMessage)
+{
+    try
+    {
+        int mappingID = Convert.ToInt32(Dts.Variables["User::MappingID"].Value);
+        string actionType = Dts.Variables["User::ActionType"].Value.ToString();
+
+        Dts.Variables["User::LogMappingID"].Value = mappingID;
+        Dts.Variables["User::LogActionType"].Value = actionType;
+        Dts.Variables["User::LogFileName"].Value = fileName;
+        Dts.Variables["User::LogStatus"].Value = status;
+        Dts.Variables["User::LogMessage"].Value = logMessage;
+
+        Console.WriteLine($"Log Captured - MappingID: {mappingID}, FileName: {fileName}, Status: {status}, Message: {logMessage}");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error while logging: {ex.Message}");
+    }
+}
