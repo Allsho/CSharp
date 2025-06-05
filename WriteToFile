@@ -1,0 +1,78 @@
+using System;
+using System.IO;
+using System.Text;
+using System.Reflection;
+using Microsoft.SqlServer.Dts.Pipeline.Wrapper;
+using Microsoft.SqlServer.Dts.Runtime.Wrapper;
+
+public class ScriptMain : UserComponent
+{
+    private StreamWriter writer;
+    private long maxSize = 1024L * 1024 * 1024; // 1GB
+    private long currentSize = 0;
+    private int fileIndex = 1;
+    private string baseFilePath = @"C:\SSISOutput\OutputFile";
+    private string[] columnNames;
+
+    public override void PreExecute()
+    {
+        base.PreExecute();
+
+        // Get column names from input buffer metadata
+        int colCount = this.ComponentMetaData.InputCollection[0]
+                          .InputColumnCollection.Count;
+        columnNames = new string[colCount];
+        for (int i = 0; i < colCount; i++)
+        {
+            columnNames[i] = this.ComponentMetaData.InputCollection[0]
+                                 .InputColumnCollection[i].Name;
+        }
+
+        OpenNewFile();
+    }
+
+    public override void PostExecute()
+    {
+        base.PostExecute();
+        writer?.Close();
+    }
+
+    public override void Input0_ProcessInputRow(Input0Buffer Row)
+    {
+        string[] values = new string[columnNames.Length];
+
+        for (int i = 0; i < columnNames.Length; i++)
+        {
+            object val = typeof(Input0Buffer).InvokeMember(
+                columnNames[i],
+                BindingFlags.GetProperty,
+                null, Row, null);
+
+            values[i] = val?.ToString()?.Replace("|", " ") ?? ""; // sanitize pipe
+        }
+
+        string line = string.Join("|", values);
+        byte[] lineBytes = Encoding.UTF8.GetBytes(line + "\n");
+
+        if (currentSize + lineBytes.Length > maxSize)
+        {
+            writer.Close();
+            fileIndex++;
+            OpenNewFile();
+        }
+
+        writer.WriteLine(line);
+        currentSize += lineBytes.Length;
+    }
+
+    private void OpenNewFile()
+    {
+        string filePath = $"{baseFilePath}_{fileIndex}.csv";
+        Directory.CreateDirectory(Path.GetDirectoryName(filePath));
+        writer = new StreamWriter(filePath, false, Encoding.UTF8);
+
+        // Write dynamic header
+        writer.WriteLine(string.Join("|", columnNames));
+        currentSize = Encoding.UTF8.GetByteCount(string.Join("|", columnNames) + "\n");
+    }
+}
