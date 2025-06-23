@@ -255,3 +255,43 @@ public void LogError(string connStr, string errorType, string message)
         }
     }
 }
+
+CREATE FUNCTION ETL.fn_SplitIds
+(
+    @Input NVARCHAR(MAX),
+    @Delimiter CHAR(1)
+)
+RETURNS @Result TABLE (Value NVARCHAR(100))
+AS
+BEGIN
+    DECLARE @Index INT = 1
+    DECLARE @NextIndex INT
+    DECLARE @Part NVARCHAR(100)
+
+    WHILE @Index > 0
+    BEGIN
+        SET @NextIndex = CHARINDEX(@Delimiter, @Input, @Index)
+        IF @NextIndex > 0
+            SET @Part = SUBSTRING(@Input, @Index, @NextIndex - @Index)
+        ELSE
+            SET @Part = SUBSTRING(@Input, @Index, LEN(@Input))
+
+        INSERT INTO @Result(Value)
+        VALUES (LTRIM(RTRIM(@Part)))
+
+        SET @Index = CASE WHEN @NextIndex > 0 THEN @NextIndex + 1 ELSE 0 END
+    END
+
+    RETURN
+END
+
+CREATE OR ALTER PROCEDURE ETL.usp_Get_Table_Mappings_ByIds
+    @MappingIds NVARCHAR(MAX)
+AS
+BEGIN
+    SELECT TargetTable, FilePattern, FileType, SourcePath, ArchivePath, Delimiter
+    FROM ETL.Table_Mapping
+    WHERE CAST(MappingID AS NVARCHAR) IN (
+        SELECT Value FROM ETL.fn_SplitIds(@MappingIds, ',')
+    );
+END
