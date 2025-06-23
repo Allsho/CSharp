@@ -233,3 +233,67 @@ enum ScriptResults
     Success = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Success,
     Failure = Microsoft.SqlServer.Dts.Runtime.DTSExecResult.Failure
 }
+
+
+private DataTable ReadCsv(string filePath, string delimiter)
+{
+    DataTable dt = new DataTable();
+    string sourceFileName = Path.GetFileName(filePath);
+
+    using (StreamReader sr = new StreamReader(filePath))
+    {
+        string headerLine = sr.ReadLine();
+        if (headerLine == null)
+            throw new Exception("CSV file is empty.");
+
+        // Check if this is a single-column quoted file (no delimiter present)
+        bool isQuotedSingleColumn = !headerLine.Contains(delimiter) && headerLine.StartsWith("\"") && headerLine.EndsWith("\"");
+
+        if (isQuotedSingleColumn)
+        {
+            string header = headerLine.Trim().Trim('"');
+            dt.Columns.Add(header);
+            dt.Columns.Add("SourceFileName");
+
+            while (!sr.EndOfStream)
+            {
+                string line = sr.ReadLine()?.Trim().Trim('"');
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    DataRow row = dt.NewRow();
+                    row[header] = line;
+                    row["SourceFileName"] = sourceFileName;
+                    dt.Rows.Add(row);
+                }
+            }
+        }
+        else
+        {
+            // Normal delimited CSV
+            string[] headers = headerLine.Split(delimiter.ToCharArray());
+            foreach (string header in headers)
+                dt.Columns.Add(header.Trim('"'));
+
+            dt.Columns.Add("SourceFileName");
+
+            while (!sr.EndOfStream)
+            {
+                string[] values = sr.ReadLine()?.Split(delimiter.ToCharArray());
+
+                if (values != null && values.Length > 0)
+                {
+                    DataRow row = dt.NewRow();
+                    for (int i = 0; i < headers.Length; i++)
+                    {
+                        row[i] = values[i].Trim('"');
+                    }
+                    row["SourceFileName"] = sourceFileName;
+                    dt.Rows.Add(row);
+                }
+            }
+        }
+    }
+
+    return dt;
+}
+
