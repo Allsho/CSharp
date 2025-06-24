@@ -277,3 +277,35 @@ public void LogError(string connStr, string errorType, string message)
         }
     }
 }
+
+public void MapColumns(DataTable dt, List<ColumnMapping> mappings)
+{
+    string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+    Log(connStr, $"-- Mapping Columns for Table --");
+
+    var dtColumns = dt.Columns.Cast<DataColumn>().Select(c => c.ColumnName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var map in mappings)
+    {
+        if (dt.Columns.Contains(map.IncomingColumn))
+        {
+            dt.Columns[map.IncomingColumn].ColumnName = map.TargetColumn;
+            Log(connStr, $"✅ Mapped: {map.IncomingColumn} ➜ {map.TargetColumn}");
+        }
+        else
+        {
+            Log(connStr, $"❌ Not Found in file: {map.IncomingColumn} (expected for target: {map.TargetColumn})");
+        }
+    }
+
+    // Optional: log columns in file that weren’t part of mapping at all
+    var mappedIncoming = new HashSet<string>(mappings.Select(m => m.IncomingColumn), StringComparer.OrdinalIgnoreCase);
+    foreach (var col in dt.Columns.Cast<DataColumn>())
+    {
+        if (!mappedIncoming.Contains(col.ColumnName))
+        {
+            Log(connStr, $"ℹ️ Unmapped file column: {col.ColumnName}");
+        }
+    }
+}
+
