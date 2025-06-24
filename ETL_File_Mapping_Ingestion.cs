@@ -46,3 +46,14 @@ public void LogSchemaDifferences(DataTable dt, string tableName, SqlConnection c
         }
     }
 }
+
+CREATE TABLE ETL.File_Schema_History (
+    ID INT IDENTITY(1,1) PRIMARY KEY,
+    FileName VARCHAR(255),
+    TargetTable VARCHAR(255),
+    ColumnName VARCHAR(255),
+    ColumnDetected BIT,
+    ColumnMapped BIT,
+    AlterStatement NVARCHAR(MAX),
+    ProcessedOn DATETIME DEFAULT GETDATE()
+);
