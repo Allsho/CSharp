@@ -309,3 +309,45 @@ public void MapColumns(DataTable dt, List<ColumnMapping> mappings)
     }
 }
 
+public void BulkInsert(DataTable dt, string tableName, string connStr)
+{
+    using (SqlConnection conn = new SqlConnection(connStr))
+    {
+        conn.Open();
+
+        // Fetch destination table column names
+        var destColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (SqlCommand cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName}", conn))
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            for (int i = 0; i < reader.FieldCount; i++)
+            {
+                destColumns.Add(reader.GetName(i));
+            }
+        }
+
+        // Log columns in DataTable
+        Log(connStr, $"BulkInsert: DataTable Columns = {string.Join(", ", dt.Columns.Cast<DataColumn>().Select(c => c.ColumnName))}");
+        Log(connStr, $"BulkInsert: Destination Table Columns = {string.Join(", ", destColumns)}");
+
+        using (SqlBulkCopy bulk = new SqlBulkCopy(conn))
+        {
+            bulk.DestinationTableName = tableName;
+
+            foreach (DataColumn col in dt.Columns)
+            {
+                if (destColumns.Contains(col.ColumnName))
+                {
+                    bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                    Log(connStr, $"Mapped: {col.ColumnName}");
+                }
+                else
+                {
+                    Log(connStr, $"⚠️ Unmatched Column (ignored): {col.ColumnName}");
+                }
+            }
+
+            bulk.WriteToServer(dt); // <- this line fails if required destination columns are unmapped
+        }
+    }
+}
