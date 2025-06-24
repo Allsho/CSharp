@@ -127,6 +127,7 @@ public void ProcessFiles(string connStr, TableMapping mapping, List<ColumnMappin
             }
 
             MapColumns(data, colMappings);
+            TruncateTargetTable(mapping.TargetTable, connStr);
             BulkInsert(data, mapping.TargetTable, connStr);
             ArchiveFile(file, mapping.ArchivePath);
             Log(connStr, $"Processed and archived: {file}");
@@ -209,6 +210,19 @@ public void MapColumns(DataTable dt, List<ColumnMapping> mappings)
     }
 }
 
+private void TruncateTargetTable(string tableName, string connStr)
+{
+    using (SqlConnection conn = new SqlConnection(connStr))
+    {
+        conn.Open();
+        using (SqlCommand cmd = new SqlCommand($"TRUNCATE TABLE {tableName}", conn))
+        {
+            cmd.ExecuteNonQuery();
+            Log(connStr, $"Truncated table: {tableName}");
+        }
+    }
+}
+
 public void BulkInsert(DataTable dt, string tableName, string connStr)
 {
     using (SqlConnection conn = new SqlConnection(connStr))
@@ -217,6 +231,14 @@ public void BulkInsert(DataTable dt, string tableName, string connStr)
         using (SqlBulkCopy bulk = new SqlBulkCopy(conn))
         {
             bulk.DestinationTableName = tableName;
+
+            // Explicit column mapping to avoid ordinal mismatch
+            foreach (DataColumn col in dt.Columns)
+            {
+                bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                Log(connStr, $"DataTable Column: {col.ColumnName}");
+            }
+
             bulk.WriteToServer(dt);
         }
     }
@@ -255,43 +277,3 @@ public void LogError(string connStr, string errorType, string message)
         }
     }
 }
-
-CREATE FUNCTION ETL.fn_SplitIds
-(
-    @Input NVARCHAR(MAX),
-    @Delimiter CHAR(1)
-)
-RETURNS @Result TABLE (Value NVARCHAR(100))
-AS
-BEGIN
-    DECLARE @Index INT = 1
-    DECLARE @NextIndex INT
-    DECLARE @Part NVARCHAR(100)
-
-    WHILE @Index > 0
-    BEGIN
-        SET @NextIndex = CHARINDEX(@Delimiter, @Input, @Index)
-        IF @NextIndex > 0
-            SET @Part = SUBSTRING(@Input, @Index, @NextIndex - @Index)
-        ELSE
-            SET @Part = SUBSTRING(@Input, @Index, LEN(@Input))
-
-        INSERT INTO @Result(Value)
-        VALUES (LTRIM(RTRIM(@Part)))
-
-        SET @Index = CASE WHEN @NextIndex > 0 THEN @NextIndex + 1 ELSE 0 END
-    END
-
-    RETURN
-END
-
-CREATE OR ALTER PROCEDURE ETL.usp_Get_Table_Mappings_ByIds
-    @MappingIds NVARCHAR(MAX)
-AS
-BEGIN
-    SELECT TargetTable, FilePattern, FileType, SourcePath, ArchivePath, Delimiter
-    FROM ETL.Table_Mapping
-    WHERE CAST(MappingID AS NVARCHAR) IN (
-        SELECT Value FROM ETL.fn_SplitIds(@MappingIds, ',')
-    );
-END
