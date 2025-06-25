@@ -1,49 +1,19 @@
-CREATE PROCEDURE ETL.usp_Log_Claim_File_Schema_History
-    @TableName NVARCHAR(255),
-    @ColumnName NVARCHAR(255),
-    @ColumnDetected BIT,
-    @ColumnMapped BIT,
-    @SuggestedAlterStatement NVARCHAR(MAX)
-AS
+IF NOT EXISTS (
+    SELECT * 
+    FROM sys.tables t 
+    JOIN sys.schemas s ON t.schema_id = s.schema_id
+    WHERE t.name = 'Claim_File_Schema_History' AND s.name = 'ETL'
+)
 BEGIN
-    INSERT INTO ETL.Claim_File_Schema_History
-    (TableName, ColumnName, ColumnDetected, ColumnMapped, SuggestedAlterStatement, ProcessedOn)
-    VALUES
-    (@TableName, @ColumnName, @ColumnDetected, @ColumnMapped, @SuggestedAlterStatement, GETDATE());
+    CREATE TABLE ETL.Claim_File_Schema_History
+    (
+        HistoryID INT IDENTITY(1,1) PRIMARY KEY,
+        TableName NVARCHAR(255) NOT NULL,
+        ColumnName NVARCHAR(255) NOT NULL,
+        ColumnDetected BIT NOT NULL,         -- Was this column found in the file?
+        ColumnMapped BIT NOT NULL,           -- Was this column mapped to the DB?
+        SuggestedAlterStatement NVARCHAR(MAX), -- Suggest ALTER if needed
+        SourceFileName NVARCHAR(255) NULL,   -- Optional: Which file triggered this?
+        ProcessedOn DATETIME NOT NULL DEFAULT GETDATE()
+    );
 END
-*/
-
-// In C#:
-public void LogSchemaDifferences(DataTable dt, string tableName, SqlConnection conn)
-{
-    HashSet<string> destColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    using (SqlCommand cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName}", conn))
-    using (SqlDataReader reader = cmd.ExecuteReader())
-    {
-        for (int i = 0; i < reader.FieldCount; i++)
-            destColumns.Add(reader.GetName(i));
-    }
-
-    foreach (DataColumn col in dt.Columns)
-    {
-        bool existsInDb = destColumns.Contains(col.ColumnName);
-        string alterStmt = existsInDb ? null : $"ALTER TABLE {tableName} ADD [{col.ColumnName}] NVARCHAR(255);";
-
-        using (SqlCommand logCmd = new SqlCommand("ETL.usp_Log_Claim_File_Schema_History", conn))
-        {
-            logCmd.CommandType = CommandType.StoredProcedure;
-            logCmd.Parameters.AddWithValue("@TableName", tableName);
-            logCmd.Parameters.AddWithValue("@ColumnName", col.ColumnName);
-            logCmd.Parameters.AddWithValue("@ColumnDetected", 1);
-            logCmd.Parameters.AddWithValue("@ColumnMapped", existsInDb ? 1 : 0);
-            logCmd.Parameters.AddWithValue("@SuggestedAlterStatement", (object)alterStmt ?? DBNull.Value);
-            logCmd.ExecuteNonQuery();
-        }
-    }
-}
-
-// In ReadCsv(): Safe row filling
-for (int i = 0; i < headers.Length; i++)
-{
-    row[i] = i < values.Length ? values[i].Trim('"') : DBNull.Value;
-}
