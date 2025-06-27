@@ -1,0 +1,70 @@
+CREATE TABLE ETL.Truncation_Log (
+    LogID INT IDENTITY(1,1) PRIMARY KEY,
+    TableName NVARCHAR(128),
+    ColumnName NVARCHAR(128),
+    RowIdentifier NVARCHAR(512),
+    ActualLength INT,
+    MaxAllowedLength INT,
+    ValueTruncated NVARCHAR(MAX),
+    LoggedAt DATETIME DEFAULT GETDATE()
+);
+
+public void LogTruncationIssues(DataTable dt, string tableName, SqlConnection conn)
+{
+    // Get destination column limits from database
+    var colLengths = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    using (SqlCommand cmd = new SqlCommand($@"
+        SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = @TableName AND CHARACTER_MAXIMUM_LENGTH IS NOT NULL", conn))
+    {
+        cmd.Parameters.AddWithValue("@TableName", tableName);
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                string colName = reader.GetString(0);
+                int maxLength = reader.IsDBNull(1) ? 0 : reader.GetInt32(1);
+                colLengths[colName] = maxLength;
+            }
+        }
+    }
+
+    // Check each row
+    foreach (DataRow row in dt.Rows)
+    {
+        foreach (DataColumn col in dt.Columns)
+        {
+            if (col.DataType != typeof(string)) continue;
+
+            string value = row[col]?.ToString();
+            if (string.IsNullOrEmpty(value)) continue;
+
+            if (colLengths.TryGetValue(col.ColumnName, out int maxAllowed) && value.Length > maxAllowed)
+            {
+                // Create a row identifier if needed
+                string rowId = row.Table.Columns.Contains("SourceFileName") ? row["SourceFileName"].ToString() : "UnknownFile";
+
+                using (SqlCommand logCmd = new SqlCommand(@"
+                    INSERT INTO ETL.Truncation_Log 
+                    (TableName, ColumnName, RowIdentifier, ActualLength, MaxAllowedLength, ValueTruncated) 
+                    VALUES (@TableName, @ColumnName, @RowIdentifier, @ActualLength, @MaxAllowedLength, @ValueTruncated)", conn))
+                {
+                    logCmd.Parameters.AddWithValue("@TableName", tableName);
+                    logCmd.Parameters.AddWithValue("@ColumnName", col.ColumnName);
+                    logCmd.Parameters.AddWithValue("@RowIdentifier", rowId);
+                    logCmd.Parameters.AddWithValue("@ActualLength", value.Length);
+                    logCmd.Parameters.AddWithValue("@MaxAllowedLength", maxAllowed);
+                    logCmd.Parameters.AddWithValue("@ValueTruncated", value.Substring(0, Math.Min(255, value.Length))); // Just a preview
+
+                    logCmd.ExecuteNonQuery();
+                }
+            }
+        }
+    }
+}
+
+
+LogTruncationIssues(data, mapping.TargetTable, conn);
+BulkInsert(data, mapping.TargetTable, conn);
+
