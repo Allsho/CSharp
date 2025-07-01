@@ -495,3 +495,27 @@
                 cmd.ExecuteNonQuery();
             }
         }
+
+
+
+// Manually promote the header row
+int headerIndex = mapping.HeaderRowIndex - 1; // zero-based index
+if (dt.Rows.Count <= headerIndex)
+    throw new Exception($"HeaderRowIndex {mapping.HeaderRowIndex} exceeds total rows in Excel sheet.");
+
+DataRow headerRow = dt.Rows[headerIndex];
+for (int i = 0; i < dt.Columns.Count; i++)
+{
+    var rawHeader = headerRow[i]?.ToString()?.Trim();
+    if (string.IsNullOrWhiteSpace(rawHeader))
+        rawHeader = $"Column{i + 1}";
+    dt.Columns[i].ColumnName = rawHeader;
+}
+
+// Remove rows up to and including header row
+for (int i = 0; i <= headerIndex; i++)
+{
+    if (dt.Rows.Count > 0) dt.Rows[0].Delete();
+}
+dt.AcceptChanges();
+
