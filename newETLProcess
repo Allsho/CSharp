@@ -412,3 +412,74 @@
          cmd.ExecuteNonQuery();
      }
  }
+
+
+
+private DataTable ReadExcel(string filePath, TableMapping mapping, List<ColumnMapping> colMappings, string connStr)
+{
+    DataTable dt = new DataTable();
+    string ext = Path.GetExtension(filePath);
+    string hdr = "Yes";
+    string sheet = mapping.SheetName?.TrimEnd('$') + "$";
+    string hdrRowIndex = mapping.HeaderRowIndex.ToString();
+
+    string connStrExcel = $"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={filePath};" +
+                          $"Extended Properties=\"Excel 12.0 Xml;HDR={hdr};IMEX=1\"";
+
+    try
+    {
+        using (OleDbConnection excelConn = new OleDbConnection(connStrExcel))
+        {
+            excelConn.Open();
+
+            // Optional: Validate sheet exists
+            DataTable sheets = excelConn.GetOleDbSchemaTable(OleDbSchemaGuid.Tables, null);
+            bool sheetExists = sheets.AsEnumerable().Any(r => r["TABLE_NAME"].ToString().Equals(sheet, StringComparison.OrdinalIgnoreCase));
+
+            if (!sheetExists)
+            {
+                LogError(connStr, "Excel Sheet Error", $"Sheet '{sheet}' not found in file: {Path.GetFileName(filePath)}");
+                throw new Exception($"Sheet '{sheet}' not found.");
+            }
+
+            string query = $"SELECT * FROM [{sheet}]";
+
+            using (OleDbDataAdapter da = new OleDbDataAdapter(query, excelConn))
+            {
+                da.Fill(dt);
+            }
+
+            // Remove rows before header row (if needed)
+            if (mapping.HeaderRowIndex > 1)
+            {
+                for (int i = 1; i < mapping.HeaderRowIndex; i++)
+                {
+                    if (dt.Rows.Count > 0) dt.Rows[0].Delete();
+                }
+                dt.AcceptChanges();
+            }
+
+            // Add SourceFileName
+            if (!dt.Columns.Contains("SourceFileName"))
+                dt.Columns.Add("SourceFileName", typeof(string));
+            foreach (DataRow row in dt.Rows)
+                row["SourceFileName"] = Path.GetFileName(filePath);
+
+            // Validate required columns (optional)
+            var requiredCols = colMappings.Where(m => m.IsRequired).Select(m => m.IncomingColumn).ToList();
+            foreach (var col in requiredCols)
+            {
+                bool found = dt.Columns.Cast<DataColumn>().Any(c => string.Equals(c.ColumnName, col, StringComparison.OrdinalIgnoreCase));
+                if (!found)
+                    throw new Exception($"Missing required column in Excel file: {col}");
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        LogError(connStr, "Excel Read Error", $"Failed to load Excel file: {filePath}. {ex.Message}");
+        throw;
+    }
+
+    return dt;
+}
