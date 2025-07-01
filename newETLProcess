@@ -1,417 +1,414 @@
-public void Main()
-{
-    string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-    string basePath = Dts.Variables["User::prmRootPath"].Value.ToString();
+ public void Main()
+ {
+     string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+     string basePath = Dts.Variables["User::prmRootPath"].Value.ToString();
 
-    try
-    {
-        Log(connStr, "ETL Process Started");
-        List<TableMapping> mappings = GetTableMappings(connStr);
+     try
+     {
+         Log(connStr, "ETL Process Started");
+         List<TableMapping> mappings = GetTableMappings(connStr);
 
-        using (SqlConnection conn = new SqlConnection(connStr))
-        {
-            conn.Open();
-            foreach (var mapping in mappings)
-            {
-                List<ColumnMapping> columnMappings = GetColumnMappings(conn, mapping.TargetTable);
-                ProcessFiles(conn, mapping, columnMappings, basePath);
-            }
-        }
+         using (SqlConnection conn = new SqlConnection(connStr))
+         {
+             conn.Open();
+             foreach (var mapping in mappings)
+             {
+                 List<ColumnMapping> columnMappings = GetColumnMappings(conn, mapping.TargetTable);
+                 ProcessFiles(conn, mapping, columnMappings, basePath);
+             }
+         }
 
-        Log(connStr, "ETL Process Completed");
-    }
-    catch (Exception ex)
-    {
-        LogError(connStr, "General Error", ex.Message);
-        Dts.TaskResult = (int)ScriptResults.Failure;
-        return;
-    }
+         Log(connStr, "ETL Process Completed");
+     }
+     catch (Exception ex)
+     {
+         LogError(connStr, "General Error", ex.Message);
+         Dts.TaskResult = (int)ScriptResults.Failure;
+         return;
+     }
 
-    Dts.TaskResult = (int)ScriptResults.Success;
-}
+     Dts.TaskResult = (int)ScriptResults.Success;
+ }
 
-public class TableMapping
-{
-    public string TargetTable;
-    public string FilePattern;
-    public string FileType;
-    public string SourcePath;
-    public string ArchivePath;
-    public string Delimiter;
-    //public string PostLoadProcedure;
-}
+ public class TableMapping
+ {
+     public string TargetTable;
+     public string FilePattern;
+     public string FileType;
+     public string SourcePath;
+     public string ArchivePath;
+     public string Delimiter;
+     //public string PostLoadProcedure;
+ }
 
-public class ColumnMapping
-{
-    public string IncomingColumn;
-    public string TargetColumn;
-    public bool IsRequired;
-}
+ public class ColumnMapping
+ {
+     public string IncomingColumn;
+     public string TargetColumn;
+     public bool IsRequired;
+ }
 
-public List<TableMapping> GetTableMappings(string connStr)
-{
-    var mappings = new List<TableMapping>();
+ public List<TableMapping> GetTableMappings(string connStr)
+ {
+     var mappings = new List<TableMapping>();
 
-    try
-    {
-        string idList = Dts.Variables["User::FilteredMappingIDs"].Value.ToString();
+     try
+     {
+         string idList = Dts.Variables["User::FilteredMappingIDs"].Value.ToString();
 
-        using (SqlConnection conn = new SqlConnection(connStr))
-        using (SqlCommand cmd = new SqlCommand("ETL.usp_Get_Table_Mappings_ByIds", conn))
-        {
-            cmd.CommandType = CommandType.StoredProcedure;
-            cmd.Parameters.AddWithValue("@MappingIds", idList);
-            conn.Open();
+         using (SqlConnection conn = new SqlConnection(connStr))
+         using (SqlCommand cmd = new SqlCommand("ETL.usp_Get_Table_Mappings_ByIds", conn))
+         {
+             cmd.CommandType = CommandType.StoredProcedure;
+             cmd.Parameters.AddWithValue("@MappingIds", idList);
+             conn.Open();
 
-            using (SqlDataReader rdr = cmd.ExecuteReader())
-            {
-                while (rdr.Read())
-                {
-                    mappings.Add(new TableMapping
-                    {
-                        TargetTable = rdr["TargetTable"].ToString(),
-                        FilePattern = rdr["FilePattern"].ToString(),
-                        FileType = rdr["FileType"].ToString(),
-                        SourcePath = rdr["SourcePath"].ToString(),
-                        ArchivePath = rdr["ArchivePath"].ToString(),
-                        Delimiter = rdr["Delimiter"].ToString()
-                        //PostLoadProcedure = rdr["PostLoadProcedure"].ToString()
-                    });
-                }
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        LogError(connStr, "Error in GetTableMappings", ex.Message);
-        Dts.TaskResult = (int)ScriptResults.Failure;
-    }
+             using (SqlDataReader rdr = cmd.ExecuteReader())
+             {
+                 while (rdr.Read())
+                 {
+                     mappings.Add(new TableMapping
+                     {
+                         TargetTable = rdr["TargetTable"].ToString(),
+                         FilePattern = rdr["FilePattern"].ToString(),
+                         FileType = rdr["FileType"].ToString(),
+                         SourcePath = rdr["SourcePath"].ToString(),
+                         ArchivePath = rdr["ArchivePath"].ToString(),
+                         Delimiter = rdr["Delimiter"].ToString()
+                         //PostLoadProcedure = rdr["PostLoadProcedure"].ToString()
+                     });
+                 }
+             }
+         }
+     }
+     catch (Exception ex)
+     {
+         LogError(connStr, "Error in GetTableMappings", ex.Message);
+         Dts.TaskResult = (int)ScriptResults.Failure;
+     }
 
-    return mappings;
-}
+     return mappings;
+ }
 
-public List<ColumnMapping> GetColumnMappings(SqlConnection conn, string targetTable)
-{
-    List<ColumnMapping> list = new List<ColumnMapping>();
+ public List<ColumnMapping> GetColumnMappings(SqlConnection conn, string targetTable)
+ {
+     List<ColumnMapping> list = new List<ColumnMapping>();
 
-    string sql = @"SELECT cdm.IncomingColumnName AS IncomingColumn, cdm.StandardizedColumnName AS TargetColumn, ISNULL(cdm.IsRequired, 0) AS IsRequired
-           FROM ETL.Claim_Data_Mapping cdm
-           JOIN ETL.Table_Mapping tm ON cdm.PayorName = tm.PayorName AND cdm.IncomingColumnName IS NOT NULL
-           WHERE tm.TargetTable = @TargetTable";
+     string sql = @"SELECT cdm.IncomingColumnName AS IncomingColumn, cdm.StandardizedColumnName AS TargetColumn, ISNULL(cdm.IsRequired, 0) AS IsRequired
+            FROM ETL.Claim_Data_Mapping cdm
+            JOIN ETL.Table_Mapping tm ON cdm.PayorName = tm.PayorName AND cdm.IncomingColumnName IS NOT NULL
+            WHERE tm.TargetTable = @TargetTable";
 
-    using (SqlCommand cmd = new SqlCommand(sql, conn))
-    {
-        cmd.Parameters.AddWithValue("@TargetTable", targetTable);
-        using (SqlDataReader rdr = cmd.ExecuteReader())
-        {
-            while (rdr.Read())
-            {
-                list.Add(new ColumnMapping
-                {
-                    IncomingColumn = rdr["IncomingColumn"].ToString(),
-                    TargetColumn = rdr["TargetColumn"].ToString(),
-                    IsRequired = Convert.ToBoolean(rdr["IsRequired"])
-                });
-            }
-        }
-    }
+     using (SqlCommand cmd = new SqlCommand(sql, conn))
+     {
+         cmd.Parameters.AddWithValue("@TargetTable", targetTable);
+         using (SqlDataReader rdr = cmd.ExecuteReader())
+         {
+             while (rdr.Read())
+             {
+                 list.Add(new ColumnMapping
+                 {
+                     IncomingColumn = rdr["IncomingColumn"].ToString(),
+                     TargetColumn = rdr["TargetColumn"].ToString(),
+                     IsRequired = Convert.ToBoolean(rdr["IsRequired"])
+                 });
+             }
+         }
+     }
 
-    return list;
-}
+     return list;
+ }
 
-public void ProcessFiles(SqlConnection conn, TableMapping mapping, List<ColumnMapping> colMappings, string basePath)
-{
-    string fullSourcePath = Path.Combine(basePath, mapping.SourcePath);
-    string[] files = Directory.GetFiles(fullSourcePath, mapping.FilePattern);
-    foreach (string file in files)
-    {
-        try
-        {
-            DataTable data = ReadCsv(file, mapping.Delimiter, colMappings);
+ public void ProcessFiles(SqlConnection conn, TableMapping mapping, List<ColumnMapping> colMappings, string basePath)
+ {
+     string fullSourcePath = Path.Combine(basePath, mapping.SourcePath);
+     string[] files = Directory.GetFiles(fullSourcePath, mapping.FilePattern);
+     foreach (string file in files)
+     {
+         try
+         {
+             DataTable data = ReadCsv(file, mapping.Delimiter, colMappings, conn.ConnectionString);
 
-            if (!data.Columns.Contains("SourceFileName"))
-                data.Columns.Add("SourceFileName", typeof(string));
+             MapColumns(data, colMappings);
+             LogTruncationIssues(data, mapping.TargetTable, conn);
+             TruncateTargetTable(mapping.TargetTable, conn);
+             BulkInsert(data, mapping.TargetTable, conn);
+             //RunPostLoadProcedure(conn, mapping.PostLoadProcedure);
+             
+             string fullArchivePath = Path.Combine(basePath, mapping.ArchivePath);
+             ArchiveFile(file, fullArchivePath);
 
-            foreach (DataRow row in data.Rows)
-                row["SourceFileName"] = Path.GetFileName(file);
+             Log(conn.ConnectionString, $"? Processed and archived: {file}");
+         }
+         catch (Exception ex)
+         {
+             LogError(conn.ConnectionString, $"? Processing error: {file}", ex.Message);
+         }
+     }
+ }
 
-            MapColumns(data, colMappings);
-            TruncateTargetTable(mapping.TargetTable, conn);
-            LogTruncationIssues(data, mapping.TargetTable, conn);
-            BulkInsert(data, mapping.TargetTable, conn);
-            //RunPostLoadProcedure(conn, mapping.PostLoadProcedure);
-            
-            string fullArchivePath = Path.Combine(basePath, mapping.ArchivePath);
-            ArchiveFile(file, fullArchivePath);
+ private DataTable ReadCsv(string filePath, string delimiter, List<ColumnMapping> colMappings, string connStr)
+ {
+     DataTable dt = new DataTable();
+     string sourceFileName = Path.GetFileName(filePath);
 
-            Log(conn.ConnectionString, $"? Processed and archived: {file}");
-        }
-        catch (Exception ex)
-        {
-            LogError(conn.ConnectionString, $"? Processing error: {file}", ex.Message);
-        }
-    }
-}
+     using (StreamReader sr = new StreamReader(filePath))
+     {
+         string headerLine = sr.ReadLine();
+         if (headerLine == null) throw new Exception("CSV file is empty.");
 
-private DataTable ReadCsv(string filePath, string delimiter, List<ColumnMapping> colMappings)
-{
-    DataTable dt = new DataTable();
-    string sourceFileName = Path.GetFileName(filePath);
+         bool isQuotedSingleColumn = !headerLine.Contains(delimiter) && headerLine.StartsWith("\"") && headerLine.EndsWith("\"");
 
-    using (StreamReader sr = new StreamReader(filePath))
-    {
-        string headerLine = sr.ReadLine();
-        if (headerLine == null) throw new Exception("CSV file is empty.");
+         if (isQuotedSingleColumn)
+         {
+             string header = headerLine.Trim().Trim('"');
+             dt.Columns.Add(header);
+             dt.Columns.Add("SourceFileName");
 
-        bool isQuotedSingleColumn = !headerLine.Contains(delimiter) && headerLine.StartsWith("\"") && headerLine.EndsWith("\"");
+             while (!sr.EndOfStream)
+             {
+                 string line = sr.ReadLine()?.Trim().Trim('"');
+                 if (!string.IsNullOrWhiteSpace(line))
+                 {
+                     DataRow row = dt.NewRow();
+                     row[header] = line;
+                     row["SourceFileName"] = sourceFileName;
+                     dt.Rows.Add(row);
+                 }
+             }
+         }
+         else
+         {
+             string[] headers = headerLine.Split(delimiter.ToCharArray());
+             foreach (string header in headers)
+                 dt.Columns.Add(header.Trim('"'));
 
-        if (isQuotedSingleColumn)
-        {
-            string header = headerLine.Trim().Trim('"');
-            dt.Columns.Add(header);
-            dt.Columns.Add("SourceFileName");
+             dt.Columns.Add("SourceFileName");
 
-            while (!sr.EndOfStream)
-            {
-                string line = sr.ReadLine()?.Trim().Trim('"');
-                if (!string.IsNullOrWhiteSpace(line))
-                {
-                    DataRow row = dt.NewRow();
-                    row[header] = line;
-                    row["SourceFileName"] = sourceFileName;
-                    dt.Rows.Add(row);
-                }
-            }
-        }
-        else
-        {
-            string[] headers = headerLine.Split(delimiter.ToCharArray());
-            foreach (string header in headers)
-                dt.Columns.Add(header.Trim('"'));
+             // Check for required columns from mapping (commented out for now)
+             
+             var requiredCols = colMappings
+                 .Where(m => m.IsRequired)
+                 .Select(m => m.IncomingColumn)
+                 .ToList();
 
-            dt.Columns.Add("SourceFileName");
+             foreach (var col in requiredCols)
+             {
+                 bool found = dt.Columns.Cast<DataColumn>()
+                                 .Any(c => string.Equals(c.ColumnName, col, StringComparison.OrdinalIgnoreCase));
+                 if (!found)
+                     throw new Exception($"Missing required column in file: {col}");
+             }
+             
 
-            // Check for required columns from mapping (commented out for now)
-            
-            var requiredCols = colMappings
-                .Where(m => m.IsRequired)
-                .Select(m => m.IncomingColumn)
-                .ToList();
+             while (!sr.EndOfStream)
+             {
+                 string[] values = sr.ReadLine()?.Split(delimiter.ToCharArray());
+                 if (values != null && values.Any(v => !string.IsNullOrWhiteSpace(v)))
+                 {
+                     if (values.Length > headers.Length)
+                     {
+                         LogError(connStr, "CSV Format Warning", $"Too many values in line of {sourceFileName}, Truncating extras.");
+                     }
+                     DataRow row = dt.NewRow();
+                     for (int i = 0; i < headers.Length; i++)
+                     {
+                         if (i < values.Length && !string.IsNullOrWhiteSpace(values[i]))
+                             row[i] = values[i].Trim('"');
+                         else
+                             row[i] = DBNull.Value;
+                     }
 
-            foreach (var col in requiredCols)
-            {
-                bool found = dt.Columns.Cast<DataColumn>()
-                                .Any(c => string.Equals(c.ColumnName, col, StringComparison.OrdinalIgnoreCase));
-                if (!found)
-                    throw new Exception($"Missing required column in file: {col}");
-            }
-            
+                     // Add SourceFileName
+                     row["SourceFileName"] = sourceFileName;
 
-            while (!sr.EndOfStream)
-            {
-                string[] values = sr.ReadLine()?.Split(delimiter.ToCharArray());
-                if (values != null && values.Any(v => !string.IsNullOrWhiteSpace(v)))
-                {
-                    DataRow row = dt.NewRow();
-                    for (int i = 0; i < headers.Length; i++)
-                    {
-                        if (i < values.Length && !string.IsNullOrWhiteSpace(values[i]))
-                            row[i] = values[i].Trim('"');
-                        else
-                            row[i] = DBNull.Value;
-                    }
+                     //Remove empty rows
+                     bool isAllEmpty = row.ItemArray.All(val => val == DBNull.Value || string.IsNullOrWhiteSpace(val?.ToString()));
+                     if (!isAllEmpty)
+                         dt.Rows.Add(row);
+                 }
+             }
+         }
+     }
 
-                    // Add SourceFileName
-                    row["SourceFileName"] = sourceFileName;
+     return dt;
+ }
 
-                    //Remove empty rows
-                    bool isAllEmpty = row.ItemArray.All(val => val == DBNull.Value || string.IsNullOrWhiteSpace(val?.ToString()));
-                    if (!isAllEmpty)
-                        dt.Rows.Add(row);
-                }
-            }
-        }
-    }
+ public void MapColumns(DataTable dt, List<ColumnMapping> mappings)
+ {
+     foreach (var map in mappings)
+     {
+         if (dt.Columns.Contains(map.IncomingColumn))
+             dt.Columns[map.IncomingColumn].ColumnName = map.TargetColumn;
+     }
+ }
 
-    return dt;
-}
+ private void TruncateTargetTable(string tableName, SqlConnection conn)
+ {
+     using (SqlCommand cmd = new SqlCommand($"TRUNCATE TABLE {tableName}", conn))
+         cmd.ExecuteNonQuery();
+ }
 
-public void MapColumns(DataTable dt, List<ColumnMapping> mappings)
-{
-    var dtColumns = new HashSet<string>(dt.Columns.Cast<DataColumn>().Select(c => c.ColumnName), StringComparer.OrdinalIgnoreCase);
-    var mappedIncoming = new HashSet<string>(mappings.Select(m => m.IncomingColumn), StringComparer.OrdinalIgnoreCase);
+ public void LogSchemaDifferences(DataTable dt, string tableName, string sourceFileName, SqlConnection conn)
+ {
+     var destColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+     using (SqlCommand cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName}", conn))
+     using (SqlDataReader reader = cmd.ExecuteReader())
+         for (int i = 0; i < reader.FieldCount; i++)
+             destColumns.Add(reader.GetName(i));
 
-    foreach (var map in mappings)
-    {
-        if (dt.Columns.Contains(map.IncomingColumn))
-            dt.Columns[map.IncomingColumn].ColumnName = map.TargetColumn;
-    }
-}
+     foreach (DataColumn col in dt.Columns)
+     {
+         bool existsInDb = destColumns.Contains(col.ColumnName);
+         string alterStmt = existsInDb ? null : $"ALTER TABLE {tableName} ADD [{col.ColumnName}] NVARCHAR(255);";
 
-private void TruncateTargetTable(string tableName, SqlConnection conn)
-{
-    using (SqlCommand cmd = new SqlCommand($"TRUNCATE TABLE {tableName}", conn))
-        cmd.ExecuteNonQuery();
-}
+         using (SqlCommand logCmd = new SqlCommand("ETL.usp_Log_Claim_File_Schema_History", conn))
+         {
+             logCmd.CommandType = CommandType.StoredProcedure;
+             logCmd.Parameters.AddWithValue("@TableName", tableName);
+             logCmd.Parameters.AddWithValue("@ColumnName", col.ColumnName);
+             logCmd.Parameters.AddWithValue("@ColumnDetected", 1);
+             logCmd.Parameters.AddWithValue("@ColumnMapped", existsInDb ? 1 : 0);
+             logCmd.Parameters.AddWithValue("@SuggestedAlterStatement", (object)alterStmt ?? DBNull.Value);
+             logCmd.Parameters.AddWithValue("@SourceFileName", sourceFileName);
+             logCmd.ExecuteNonQuery();
+         }
+     }
+ }
 
-public void LogSchemaDifferences(DataTable dt, string tableName, string sourceFileName, SqlConnection conn)
-{
-    var destColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    using (SqlCommand cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName}", conn))
-    using (SqlDataReader reader = cmd.ExecuteReader())
-        for (int i = 0; i < reader.FieldCount; i++)
-            destColumns.Add(reader.GetName(i));
+ public void LogTruncationIssues(DataTable dt, string tableName, SqlConnection conn)
+ {
+     // Get destination column limits from database
+     var colLengths = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+     using (SqlCommand cmd = new SqlCommand($@"
+         SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_NAME = @TableName AND CHARACTER_MAXIMUM_LENGTH IS NOT NULL", conn))
+     {
+         cmd.Parameters.AddWithValue("@TableName", tableName);
+         using (SqlDataReader reader = cmd.ExecuteReader())
+         {
+             while (reader.Read())
+             {
+                 string colName = reader.GetString(0);
+                 int maxLength = reader.IsDBNull(1) ? 0 : reader.GetInt32(1);
+                 colLengths[colName] = maxLength;
+             }
+         }
+     }
 
-    foreach (DataColumn col in dt.Columns)
-    {
-        bool existsInDb = destColumns.Contains(col.ColumnName);
-        string alterStmt = existsInDb ? null : $"ALTER TABLE {tableName} ADD [{col.ColumnName}] NVARCHAR(255);";
+     // Check each row
+     foreach (DataRow row in dt.Rows)
+     {
+         foreach (DataColumn col in dt.Columns)
+         {
+             if (col.DataType != typeof(string)) continue;
 
-        using (SqlCommand logCmd = new SqlCommand("ETL.usp_Log_Claim_File_Schema_History", conn))
-        {
-            logCmd.CommandType = CommandType.StoredProcedure;
-            logCmd.Parameters.AddWithValue("@TableName", tableName);
-            logCmd.Parameters.AddWithValue("@ColumnName", col.ColumnName);
-            logCmd.Parameters.AddWithValue("@ColumnDetected", 1);
-            logCmd.Parameters.AddWithValue("@ColumnMapped", existsInDb ? 1 : 0);
-            logCmd.Parameters.AddWithValue("@SuggestedAlterStatement", (object)alterStmt ?? DBNull.Value);
-            logCmd.Parameters.AddWithValue("@SourceFileName", sourceFileName);
-            logCmd.ExecuteNonQuery();
-        }
-    }
-}
+             if (!colLengths.TryGetValue(col.ColumnName, out int maxAllowed)) continue;
 
-public void LogTruncationIssues(DataTable dt, string tableName, SqlConnection conn)
-{
-    // Get destination column limits from database
-    var colLengths = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-    using (SqlCommand cmd = new SqlCommand($@"
-        SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_NAME = @TableName AND CHARACTER_MAXIMUM_LENGTH IS NOT NULL", conn))
-    {
-        cmd.Parameters.AddWithValue("@TableName", tableName);
-        using (SqlDataReader reader = cmd.ExecuteReader())
-        {
-            while (reader.Read())
-            {
-                string colName = reader.GetString(0);
-                int maxLength = reader.IsDBNull(1) ? 0 : reader.GetInt32(1);
-                colLengths[colName] = maxLength;
-            }
-        }
-    }
+             string value = row[col]?.ToString();
+             if (string.IsNullOrEmpty(value)) continue;
 
-    // Check each row
-    foreach (DataRow row in dt.Rows)
-    {
-        foreach (DataColumn col in dt.Columns)
-        {
-            if (col.DataType != typeof(string)) continue;
+             if (value.Length > maxAllowed)
+             {
+                 // Create a row identifier if needed
+                 string rowId = row.Table.Columns.Contains("SourceFileName") ? row["SourceFileName"].ToString() : "UnknownFile";
 
-            string value = row[col]?.ToString();
-            if (string.IsNullOrEmpty(value)) continue;
+                 using (SqlCommand logCmd = new SqlCommand(@"
+                     INSERT INTO ETL.Truncation_Log 
+                     (TableName, ColumnName, RowIdentifier, ActualLength, MaxAllowedLength, ValueTruncated) 
+                     VALUES (@TableName, @ColumnName, @RowIdentifier, @ActualLength, @MaxAllowedLength, @ValueTruncated)", conn))
+                 {
+                     logCmd.Parameters.AddWithValue("@TableName", tableName);
+                     logCmd.Parameters.AddWithValue("@ColumnName", col.ColumnName);
+                     logCmd.Parameters.AddWithValue("@RowIdentifier", rowId);
+                     logCmd.Parameters.AddWithValue("@ActualLength", value.Length);
+                     logCmd.Parameters.AddWithValue("@MaxAllowedLength", maxAllowed);
+                     logCmd.Parameters.AddWithValue("@ValueTruncated", value.Substring(0, Math.Min(255, value.Length))); // Just a preview
 
-            if (colLengths.TryGetValue(col.ColumnName, out int maxAllowed) && value.Length > maxAllowed)
-            {
-                // Create a row identifier if needed
-                string rowId = row.Table.Columns.Contains("SourceFileName") ? row["SourceFileName"].ToString() : "UnknownFile";
+                     logCmd.ExecuteNonQuery();
+                 }
+             }
+         }
+     }
+ }
 
-                using (SqlCommand logCmd = new SqlCommand(@"
-                    INSERT INTO ETL.Truncation_Log 
-                    (TableName, ColumnName, RowIdentifier, ActualLength, MaxAllowedLength, ValueTruncated) 
-                    VALUES (@TableName, @ColumnName, @RowIdentifier, @ActualLength, @MaxAllowedLength, @ValueTruncated)", conn))
-                {
-                    logCmd.Parameters.AddWithValue("@TableName", tableName);
-                    logCmd.Parameters.AddWithValue("@ColumnName", col.ColumnName);
-                    logCmd.Parameters.AddWithValue("@RowIdentifier", rowId);
-                    logCmd.Parameters.AddWithValue("@ActualLength", value.Length);
-                    logCmd.Parameters.AddWithValue("@MaxAllowedLength", maxAllowed);
-                    logCmd.Parameters.AddWithValue("@ValueTruncated", value.Substring(0, Math.Min(255, value.Length))); // Just a preview
+ public void BulkInsert(DataTable dt, string tableName, SqlConnection conn)
+ {
+     LogSchemaDifferences(dt, tableName, dt.Rows[0]["SourceFileName"].ToString(), conn);
 
-                    logCmd.ExecuteNonQuery();
-                }
-            }
-        }
-    }
-}
+     var destColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+     using (SqlCommand cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName}", conn))
+     using (SqlDataReader reader = cmd.ExecuteReader())
+         for (int i = 0; i < reader.FieldCount; i++)
+             destColumns.Add(reader.GetName(i));
 
-public void BulkInsert(DataTable dt, string tableName, SqlConnection conn)
-{
-    LogSchemaDifferences(dt, tableName, dt.Rows[0]["SourceFileName"].ToString(), conn);
+     using (SqlBulkCopy bulk = new SqlBulkCopy(conn))
+     {
+         bulk.BulkCopyTimeout = 300; // Seconds
+         bulk.DestinationTableName = tableName;
+         foreach (DataColumn col in dt.Columns)
+         {
+             if (destColumns.Contains(col.ColumnName))
+                 bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+         }
+         bulk.WriteToServer(dt);
+     }
+ }
 
-    var destColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-    using (SqlCommand cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName}", conn))
-    using (SqlDataReader reader = cmd.ExecuteReader())
-        for (int i = 0; i < reader.FieldCount; i++)
-            destColumns.Add(reader.GetName(i));
+ public void RunPostLoadProcedure(SqlConnection conn, string procedureName)
+ {
+     if (string.IsNullOrWhiteSpace(procedureName))
+         return;
 
-    using (SqlBulkCopy bulk = new SqlBulkCopy(conn))
-    {
-        bulk.BulkCopyTimeout = 300; // Seconds
-        bulk.DestinationTableName = tableName;
-        foreach (DataColumn col in dt.Columns)
-        {
-            if (destColumns.Contains(col.ColumnName))
-                bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
-        }
-        bulk.WriteToServer(dt);
-    }
-}
+     try
+     {
+         using (SqlCommand cmd = new SqlCommand(procedureName, conn))
+         {
+             cmd.CommandType = CommandType.StoredProcedure;
+             cmd.ExecuteNonQuery();
+         }
 
-public void RunPostLoadProcedure(SqlConnection conn, string procedureName)
-{
-    if (string.IsNullOrWhiteSpace(procedureName))
-        return;
+         Log(conn.ConnectionString, $"Post-load procedure executed: {procedureName}");
+     }
+     catch (Exception ex)
+     {
+         LogError(conn.ConnectionString, $"Failed to execute post-load proc: {procedureName}", ex.Message);
+     }
+ }
 
-    try
-    {
-        using (SqlCommand cmd = new SqlCommand(procedureName, conn))
-        {
-            cmd.CommandType = CommandType.StoredProcedure;
-            cmd.ExecuteNonQuery();
-        }
+ public void ArchiveFile(string filePath, string archivePath)
+ {
+     string yearMonth = DateTime.Now.ToString("yyyyMM");
+     string subfolder = Path.Combine(archivePath, yearMonth);
 
-        Log(conn.ConnectionString, $"Post-load procedure executed: {procedureName}");
-    }
-    catch (Exception ex)
-    {
-        LogError(conn.ConnectionString, $"Failed to execute post-load proc: {procedureName}", ex.Message);
-    }
-}
+     if (!Directory.Exists(subfolder))
+         Directory.CreateDirectory(subfolder);
 
-public void ArchiveFile(string filePath, string archivePath)
-{
-    string yearMonth = DateTime.Now.ToString("yyyyMM");
-    string subfolder = Path.Combine(archivePath, yearMonth);
+     string destPath = Path.Combine(subfolder, Path.GetFileName(filePath));
+     File.Move(filePath, destPath);
+ }
 
-    if (!Directory.Exists(subfolder))
-        Directory.CreateDirectory(subfolder);
+ public void Log(string connStr, string message)
+ {
+     using (SqlConnection conn = new SqlConnection(connStr))
+     using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL.Claims_Log (LogTimestamp, Message) VALUES (@ts, @msg)", conn))
+     {
+         cmd.Parameters.AddWithValue("@ts", DateTime.Now);
+         cmd.Parameters.AddWithValue("@msg", message);
+         conn.Open();
+         cmd.ExecuteNonQuery();
+     }
+ }
 
-    string destPath = Path.Combine(subfolder, Path.GetFileName(filePath));
-    File.Move(filePath, destPath);
-}
-
-public void Log(string connStr, string message)
-{
-    using (SqlConnection conn = new SqlConnection(connStr))
-    using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL.Claims_Log (LogTimestamp, Message) VALUES (@ts, @msg)", conn))
-    {
-        cmd.Parameters.AddWithValue("@ts", DateTime.Now);
-        cmd.Parameters.AddWithValue("@msg", message);
-        conn.Open();
-        cmd.ExecuteNonQuery();
-    }
-}
-
-public void LogError(string connStr, string errorType, string message)
-{
-    using (SqlConnection conn = new SqlConnection(connStr))
-    using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL.Claims_Error_Log (LogTimestamp, Message) VALUES (@ts, @msg)", conn))
-    {
-        cmd.Parameters.AddWithValue("@ts", DateTime.Now);
-        cmd.Parameters.AddWithValue("@msg", message);
-        conn.Open();
-        cmd.ExecuteNonQuery();
-    }
-}
+ public void LogError(string connStr, string errorType, string message)
+ {
+     using (SqlConnection conn = new SqlConnection(connStr))
+     using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL.Claims_Error_Log (LogTimestamp, Message) VALUES (@ts, @msg)", conn))
+     {
+         cmd.Parameters.AddWithValue("@ts", DateTime.Now);
+         cmd.Parameters.AddWithValue("@msg", $"{errorType}: {message}");
+         conn.Open();
+         cmd.ExecuteNonQuery();
+     }
+ }
