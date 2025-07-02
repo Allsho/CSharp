@@ -89,7 +89,6 @@ public List<TableMapping> GetTableMappings(string connStr)
     catch (Exception ex)
     {
         LogError(connStr, "Error in GetTableMappings", ex.Message);
-        Dts.TaskResult = (int)ScriptResults.Failure;
     }
 
     return mappings;
@@ -143,14 +142,19 @@ public void ProcessFiles(SqlConnection conn, TableMapping mapping, List<ColumnMa
                 data = ReadCsv(file, mapping.Delimiter, colMappings, conn.ConnectionString);
             }
 
-            MapColumns(data, colMappings);
+            MapColumns(data, colMappings, conn.ConnectionString);
+
+            // Log Final columsn after mapping
+            Log(conn.ConnectionString, $"Final columns after mapping for {mapping.TargetTable}: " +
+                string.Join(", ", data.Columns.Cast<DataColumn>().Select(c => c.ColumnName)));
+
             LogTruncationIssues(data, mapping.TargetTable, conn);
             TruncateTargetTable(mapping.TargetTable, conn);
-            BulkInsert(data, mapping.TargetTable, conn);
+            BulkInsert(data, mapping.TargetTable, conn, conn.ConnectionString);
             //RunPostLoadProcedure(conn, mapping.PostLoadProcedure);
             
             string fullArchivePath = Path.Combine(basePath, mapping.ArchivePath);
-            ArchiveFile(file, fullArchivePath);
+            //ArchiveFile(file, fullArchivePath);
 
             Log(conn.ConnectionString, $"? Processed and archived: {file}");
         }
@@ -282,8 +286,8 @@ private DataTable ReadExcel(string filePath, TableMapping mapping, List<ColumnMa
                 da.Fill(dt);
             }
 
-            // Manually promote the header row
-            int headerIndex = mapping.HeaderRowIndex - 1; // zero-based index
+            // Promote the header row
+            int headerIndex = mapping.HeaderRowIndex - 1;
             if (dt.Rows.Count <= headerIndex)
                 throw new Exception($"HeaderRowIndex {mapping.HeaderRowIndex} exceeds total rows in Excel sheet.");
 
@@ -296,31 +300,38 @@ private DataTable ReadExcel(string filePath, TableMapping mapping, List<ColumnMa
                 dt.Columns[i].ColumnName = rawHeader;
             }
 
-            // Remove rows up to and including header row
-            for (int i = 0; i <= headerIndex; i++)
-            {
-                if (dt.Rows.Count > 0) dt.Rows[0].Delete();
-            }
-            dt.AcceptChanges();
+            //// Remove header row only (don't delete it twice)
+            //dt.Rows.RemoveAt(headerIndex);
 
-            // Remove rows before header row (if needed)
-            if (mapping.HeaderRowIndex > 1)
-            {
-                for (int i = 1; i < mapping.HeaderRowIndex; i++)
-                {
-                    if (dt.Rows.Count > 0) dt.Rows[0].Delete();
-                }
-                dt.AcceptChanges();
-            }
+            //// If you need to remove rows before header (rarely needed, be careful) - BRING IT BACK 
+            //if (headerIndex > 0)
+            //{
+            //    for (int i = 0; i < headerIndex; i++)
+            //    {
+            //        if (dt.Rows.Count > 0)
+            //            dt.Rows.RemoveAt(0);
+            //    }
+            //}
+            //dt.AcceptChanges();
+
+            //// Remove rows before header row (if needed)
+            //if (mapping.HeaderRowIndex > 1)
+            //{
+            //    for (int i = 1; i < mapping.HeaderRowIndex; i++)
+            //    {
+            //        if (dt.Rows.Count > 0) dt.Rows[0].Delete();
+            //    }
+            //    dt.AcceptChanges();
+            //}
 
             // Remove empty Rows
-            if (dt.Rows.Count > 0)
-            {
-                dt = dt.AsEnumerable()
-                        .Where(row => row.ItemArray.Any(cell =>
-                            cell != null && !string.IsNullOrWhiteSpace(cell.ToString())))
-                        .CopyToDataTable();
-            }
+            //if (dt.Rows.Count > 0)
+            //{
+            //    dt = dt.AsEnumerable()
+            //            .Where(row => row.ItemArray.Any(cell =>
+            //                cell != null && !string.IsNullOrWhiteSpace(cell.ToString())))
+            //            .CopyToDataTable();
+            //}
 
 
             // Add SourceFileName
@@ -328,12 +339,6 @@ private DataTable ReadExcel(string filePath, TableMapping mapping, List<ColumnMa
                 dt.Columns.Add("SourceFileName", typeof(string));
             foreach (DataRow row in dt.Rows)
                 row["SourceFileName"] = Path.GetFileName(filePath);
-
-            // Check incoming headers
-            foreach (DataColumn col in dt.Columns)
-            {
-                Log(connStr, $"Excel COlumn Detected: '{col.ColumnName}'");
-            }
 
             // Validate required columns (optional)
             var requiredCols = colMappings.Where(m => m.IsRequired).Select(m => m.IncomingColumn).ToList();
@@ -354,12 +359,16 @@ private DataTable ReadExcel(string filePath, TableMapping mapping, List<ColumnMa
     return dt;
 }
 
-public void MapColumns(DataTable dt, List<ColumnMapping> mappings)
+public void MapColumns(DataTable dt, List<ColumnMapping> mappings, string connStr)
 {
     foreach (var map in mappings)
     {
-        if (dt.Columns.Contains(map.IncomingColumn))
-            dt.Columns[map.IncomingColumn].ColumnName = map.TargetColumn;
+        var normalizedName = dt.Columns.Cast<DataColumn>()
+            .FirstOrDefault(c => c.ColumnName.Trim().Equals(map.IncomingColumn.Trim(), StringComparison.OrdinalIgnoreCase));
+        if (normalizedName != null)
+            dt.Columns[normalizedName.ColumnName].ColumnName = map.IncomingColumn;
+        else
+            Log(connStr, $"Incoming column not matched: {map.IncomingColumn}");
     }
 }
 
@@ -453,7 +462,7 @@ public void LogTruncationIssues(DataTable dt, string tableName, SqlConnection co
     }
 }
 
-public void BulkInsert(DataTable dt, string tableName, SqlConnection conn)
+public void BulkInsert(DataTable dt, string tableName, SqlConnection conn, string connStr)
 {
     LogSchemaDifferences(dt, tableName, dt.Rows[0]["SourceFileName"].ToString(), conn);
 
@@ -463,6 +472,12 @@ public void BulkInsert(DataTable dt, string tableName, SqlConnection conn)
         for (int i = 0; i < reader.FieldCount; i++)
             destColumns.Add(reader.GetName(i));
 
+    foreach (DataRow row in dt.Rows)
+    {
+        string values = string.Join(", ", row.ItemArray.Select(x => x.ToString()));
+        Log(connStr, $"Data Row: {values}");
+    }
+
     using (SqlBulkCopy bulk = new SqlBulkCopy(conn))
     {
         bulk.BulkCopyTimeout = 300; // Seconds
@@ -470,7 +485,13 @@ public void BulkInsert(DataTable dt, string tableName, SqlConnection conn)
         foreach (DataColumn col in dt.Columns)
         {
             if (destColumns.Contains(col.ColumnName))
+            {
                 bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+            }
+            else
+            {
+                Log(conn.ConnectionString, $" Column not in destination table: {col.ColumnName}");
+            }
         }
         bulk.WriteToServer(dt);
     }
@@ -532,31 +553,3 @@ public void LogError(string connStr, string errorType, string message)
         cmd.ExecuteNonQuery();
     }
 }
-
-
-// Promote the header row
-int headerIndex = mapping.HeaderRowIndex - 1;
-if (dt.Rows.Count <= headerIndex)
-    throw new Exception($"HeaderRowIndex {mapping.HeaderRowIndex} exceeds total rows in Excel sheet.");
-
-DataRow headerRow = dt.Rows[headerIndex];
-for (int i = 0; i < dt.Columns.Count; i++)
-{
-    var rawHeader = headerRow[i]?.ToString()?.Trim();
-    if (string.IsNullOrWhiteSpace(rawHeader))
-        rawHeader = $"Column{i + 1}";
-    dt.Columns[i].ColumnName = rawHeader;
-}
-
-// ❌ REMOVE THIS DUPLICATE BLOCK:
-// Remove rows up to and including header row
-// for (int i = 0; i <= headerIndex; i++) ...
-
-// ✅ REPLACE with this:
-for (int i = 0; i <= headerIndex; i++)
-{
-    if (i < dt.Rows.Count)
-        dt.Rows[i].Delete();
-}
-dt.AcceptChanges();
-
