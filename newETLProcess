@@ -497,6 +497,29 @@ public void BulkInsert(DataTable dt, string tableName, SqlConnection conn, strin
     }
 }
 
+public void BulkInsert(DataTable dt, string tableName, SqlConnection conn)
+{
+    LogSchemaDifferences(dt, tableName, dt.Rows[0]["SourceFileName"].ToString(), conn);
+
+    var destColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    using (SqlCommand cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName}", conn))
+    using (SqlDataReader reader = cmd.ExecuteReader())
+        for (int i = 0; i < reader.FieldCount; i++)
+            destColumns.Add(reader.GetName(i));
+
+    using (SqlBulkCopy bulk = new SqlBulkCopy(conn))
+    {
+        bulk.BulkCopyTimeout = 300; // Seconds
+        bulk.DestinationTableName = tableName;
+        foreach (DataColumn col in dt.Columns)
+        {
+            if (destColumns.Contains(col.ColumnName))
+                bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+        }
+        bulk.WriteToServer(dt);
+    }
+}
+
 public void RunPostLoadProcedure(SqlConnection conn, string procedureName)
 {
     if (string.IsNullOrWhiteSpace(procedureName))
