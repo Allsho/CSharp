@@ -1,6 +1,7 @@
 public void Main()
 {
     string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+    string basePath = Dts.Variables["User::prmRootPath"].Value.ToString();
 
     try
     {
@@ -13,7 +14,7 @@ public void Main()
             foreach (var mapping in mappings)
             {
                 List<ColumnMapping> columnMappings = GetColumnMappings(conn, mapping.TargetTable);
-                ProcessFiles(conn, mapping, columnMappings);
+                ProcessFiles(conn, mapping, columnMappings, basePath);
             }
         }
 
@@ -37,41 +38,57 @@ public class TableMapping
     public string SourcePath;
     public string ArchivePath;
     public string Delimiter;
+    //public string PostLoadProcedure;
+    //Add Excel Info
+    public string SheetName;
+    public int HeaderRowIndex = 1; // Default to 1 (Excel rows are 1-based)
 }
 
 public class ColumnMapping
 {
     public string IncomingColumn;
     public string TargetColumn;
+    public bool IsRequired;
 }
 
 public List<TableMapping> GetTableMappings(string connStr)
 {
     var mappings = new List<TableMapping>();
-    string idList = Dts.Variables["User::FilteredMappingIDs"].Value.ToString();
 
-    using (SqlConnection conn = new SqlConnection(connStr))
-    using (SqlCommand cmd = new SqlCommand("ETL.usp_Get_Table_Mappings_ByIds", conn))
+    try
     {
-        cmd.CommandType = CommandType.StoredProcedure;
-        cmd.Parameters.AddWithValue("@MappingIds", idList);
-        conn.Open();
+        string idList = Dts.Variables["User::FilteredMappingIDs"].Value.ToString();
 
-        using (SqlDataReader rdr = cmd.ExecuteReader())
+        using (SqlConnection conn = new SqlConnection(connStr))
+        using (SqlCommand cmd = new SqlCommand("ETL.usp_Get_Table_Mappings_ByIds", conn))
         {
-            while (rdr.Read())
+            cmd.CommandType = CommandType.StoredProcedure;
+            cmd.Parameters.AddWithValue("@MappingIds", idList);
+            conn.Open();
+
+            using (SqlDataReader rdr = cmd.ExecuteReader())
             {
-                mappings.Add(new TableMapping
+                while (rdr.Read())
                 {
-                    TargetTable = rdr["TargetTable"].ToString(),
-                    FilePattern = rdr["FilePattern"].ToString(),
-                    FileType = rdr["FileType"].ToString(),
-                    SourcePath = rdr["SourcePath"].ToString(),
-                    ArchivePath = rdr["ArchivePath"].ToString(),
-                    Delimiter = rdr["Delimiter"].ToString()
-                });
+                    mappings.Add(new TableMapping
+                    {
+                        TargetTable = rdr["TargetTable"].ToString(),
+                        FilePattern = rdr["FilePattern"].ToString(),
+                        FileType = rdr["FileType"].ToString(),
+                        SourcePath = rdr["SourcePath"].ToString(),
+                        ArchivePath = rdr["ArchivePath"].ToString(),
+                        Delimiter = rdr["Delimiter"].ToString(),
+                        //PostLoadProcedure = rdr["PostLoadProcedure"].ToString(),
+                        SheetName = rdr["SheetName"].ToString(),
+                        HeaderRowIndex = rdr["HeaderRowIndex"] != DBNull.Value ? Convert.ToInt32(rdr["HeaderRowIndex"]) : 1
+                    });
+                }
             }
         }
+    }
+    catch (Exception ex)
+    {
+        LogError(connStr, "Error in GetTableMappings", ex.Message);
     }
 
     return mappings;
@@ -81,7 +98,7 @@ public List<ColumnMapping> GetColumnMappings(SqlConnection conn, string targetTa
 {
     List<ColumnMapping> list = new List<ColumnMapping>();
 
-    string sql = @"SELECT cdm.IncomingColumnName AS IncomingColumn, cdm.StandardizedColumnName AS TargetColumn
+    string sql = @"SELECT cdm.IncomingColumnName AS IncomingColumn, cdm.StandardizedColumnName AS TargetColumn, ISNULL(cdm.IsRequired, 0) AS IsRequired
            FROM ETL.Claim_Data_Mapping cdm
            JOIN ETL.Table_Mapping tm ON cdm.PayorName = tm.PayorName AND cdm.IncomingColumnName IS NOT NULL
            WHERE tm.TargetTable = @TargetTable";
@@ -96,7 +113,8 @@ public List<ColumnMapping> GetColumnMappings(SqlConnection conn, string targetTa
                 list.Add(new ColumnMapping
                 {
                     IncomingColumn = rdr["IncomingColumn"].ToString(),
-                    TargetColumn = rdr["TargetColumn"].ToString()
+                    TargetColumn = rdr["TargetColumn"].ToString(),
+                    IsRequired = Convert.ToBoolean(rdr["IsRequired"])
                 });
             }
         }
@@ -105,27 +123,36 @@ public List<ColumnMapping> GetColumnMappings(SqlConnection conn, string targetTa
     return list;
 }
 
-public void ProcessFiles(SqlConnection conn, TableMapping mapping, List<ColumnMapping> colMappings)
+public void ProcessFiles(SqlConnection conn, TableMapping mapping, List<ColumnMapping> colMappings, string basePath)
 {
-    string[] files = Directory.GetFiles(mapping.SourcePath, mapping.FilePattern);
+    string fullSourcePath = Path.Combine(basePath, mapping.SourcePath);
+    string[] files = Directory.GetFiles(fullSourcePath, mapping.FilePattern);
     foreach (string file in files)
     {
         try
         {
-            DataTable data = ReadCsv(file, mapping.Delimiter);
+            DataTable data;
 
-            if (!data.Columns.Contains("SourceFileName"))
-                data.Columns.Add("SourceFileName", typeof(string));
+            if (mapping.FileType.ToLower().Contains("excel"))
+            {
+                data = ReadExcel(file, mapping, colMappings, conn.ConnectionString);
+            }
+            else
+            {
+                data = ReadCsv(file, mapping.Delimiter, colMappings, conn.ConnectionString);
+            }
 
-            foreach (DataRow row in data.Rows)
-                row["SourceFileName"] = Path.GetFileName(file);
+            MapColumns(data, colMappings, conn.ConnectionString);
 
-            MapColumns(data, colMappings);
+            LogTruncationIssues(data, mapping.TargetTable, conn);
             TruncateTargetTable(mapping.TargetTable, conn);
             BulkInsert(data, mapping.TargetTable, conn);
-            ArchiveFile(file, mapping.ArchivePath);
+            //RunPostLoadProcedure(conn, mapping.PostLoadProcedure);
+            
+            string fullArchivePath = Path.Combine(basePath, mapping.ArchivePath);
+            //ArchiveFile(file, fullArchivePath);
 
-            Log(conn.ConnectionString, $"? Processed and archived: {file}");
+            //Log(conn.ConnectionString, $"? Processed and archived: {file}");
         }
         catch (Exception ex)
         {
@@ -134,7 +161,7 @@ public void ProcessFiles(SqlConnection conn, TableMapping mapping, List<ColumnMa
     }
 }
 
-private DataTable ReadCsv(string filePath, string delimiter)
+private DataTable ReadCsv(string filePath, string delimiter, List<ColumnMapping> colMappings, string connStr)
 {
     DataTable dt = new DataTable();
     string sourceFileName = Path.GetFileName(filePath);
@@ -172,17 +199,47 @@ private DataTable ReadCsv(string filePath, string delimiter)
 
             dt.Columns.Add("SourceFileName");
 
+            // Check for required columns from mapping (commented out for now)
+            
+            var requiredCols = colMappings
+                .Where(m => m.IsRequired)
+                .Select(m => m.IncomingColumn)
+                .ToList();
+
+            foreach (var col in requiredCols)
+            {
+                bool found = dt.Columns.Cast<DataColumn>()
+                                .Any(c => string.Equals(c.ColumnName, col, StringComparison.OrdinalIgnoreCase));
+                if (!found)
+                    throw new Exception($"Missing required column in file: {col}");
+            }
+            
+
             while (!sr.EndOfStream)
             {
                 string[] values = sr.ReadLine()?.Split(delimiter.ToCharArray());
-                if (values != null && values.Length > 0)
+                if (values != null && values.Any(v => !string.IsNullOrWhiteSpace(v)))
                 {
+                    if (values.Length > headers.Length)
+                    {
+                        LogError(connStr, "CSV Format Warning", $"Too many values in line of {sourceFileName}, Truncating extras.");
+                    }
                     DataRow row = dt.NewRow();
                     for (int i = 0; i < headers.Length; i++)
-                        row[i] = (i < values.Length) ? values[i].Trim('"') : "";
+                    {
+                        if (i < values.Length && !string.IsNullOrWhiteSpace(values[i]))
+                            row[i] = values[i].Trim('"');
+                        else
+                            row[i] = DBNull.Value;
+                    }
 
+                    // Add SourceFileName
                     row["SourceFileName"] = sourceFileName;
-                    dt.Rows.Add(row);
+
+                    //Remove empty rows
+                    bool isAllEmpty = row.ItemArray.All(val => val == DBNull.Value || string.IsNullOrWhiteSpace(val?.ToString()));
+                    if (!isAllEmpty)
+                        dt.Rows.Add(row);
                 }
             }
         }
@@ -191,11 +248,139 @@ private DataTable ReadCsv(string filePath, string delimiter)
     return dt;
 }
 
-public void MapColumns(DataTable dt, List<ColumnMapping> mappings)
+private DataTable ReadExcel(string filePath, TableMapping mapping, List<ColumnMapping> colMappings, string connStr)
 {
-    var dtColumns = new HashSet<string>(dt.Columns.Cast<DataColumn>().Select(c => c.ColumnName), StringComparer.OrdinalIgnoreCase);
-    var mappedIncoming = new HashSet<string>(mappings.Select(m => m.IncomingColumn), StringComparer.OrdinalIgnoreCase);
+    DataTable dt = new DataTable();
+    string ext = Path.GetExtension(filePath);
+    string hdr = "No";
+    string sheet = mapping.SheetName?.TrimEnd('$') + "$";
+    string hdrRowIndex = mapping.HeaderRowIndex.ToString();
 
+    string connStrExcel = $"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={filePath};" +
+                          $"Extended Properties=\"Excel 12.0 Xml;HDR={hdr};IMEX=1;TypeGuessRows=0;ImportMixedTypes=Text\"";
+
+    try
+    {
+        using (OleDbConnection excelConn = new OleDbConnection(connStrExcel))
+        {
+            excelConn.Open();
+
+            // Optional: Validate sheet exists
+            DataTable sheets = excelConn.GetOleDbSchemaTable(OleDbSchemaGuid.Tables, null);
+            foreach (DataRow row in sheets.Rows)
+            {
+                string sheetName = row["TABLE_NAME"].ToString();
+                Log(connStr, $"Found sheet: {sheetName}");
+            }
+            
+            string expectedSheet = mapping.SheetName.TrimEnd('$') + "$";
+
+            // Try to match ignoring quotes and casing
+            string matchedSheetName = sheets.AsEnumerable()
+                .Select(r => r["TABLE_NAME"].ToString().Trim('\''))
+                .FirstOrDefault(name => name.Equals(expectedSheet, StringComparison.OrdinalIgnoreCase));
+
+            if (matchedSheetName == null)
+            {
+                LogError(connStr, "Excel Sheet Error", $"Sheet '{expectedSheet}' not found in file: {Path.GetFileName(filePath)}. Available sheets: " +
+                    string.Join(", ", sheets.AsEnumerable().Select(r => r["TABLE_NAME"].ToString())));
+                throw new Exception($"Sheet '{expectedSheet}' not found.");
+            }
+
+            string query = $"SELECT * FROM [{matchedSheetName}]";
+
+            using (OleDbDataAdapter da = new OleDbDataAdapter(query, excelConn))
+            {
+                da.Fill(dt);
+            }
+
+            DataTable schemaTable = excelConn.GetOleDbSchemaTable(OleDbSchemaGuid.Columns,
+            new object[] { null, null, matchedSheetName, null });
+
+            foreach (DataRow row in schemaTable.Rows)
+            {
+                string colName = row["COLUMN_NAME"].ToString();
+                int ordinal = (int)row["ORDINAL_POSITION"];
+                Log(connStr, $"Schema Column {ordinal}: {colName}");
+            }
+
+            // Promote the header row
+            int headerIndex = mapping.HeaderRowIndex - 1;
+            if (dt.Rows.Count <= headerIndex)
+                throw new Exception($"HeaderRowIndex {mapping.HeaderRowIndex} exceeds total rows in Excel sheet.");
+
+            DataRow headerRow = dt.Rows[headerIndex];
+            for (int i = 0; i < dt.Columns.Count; i++)
+            {
+                string rawHeader = headerRow[i]?.ToString()?.Trim();
+
+                // Replace odd characters
+                if (!string.IsNullOrWhiteSpace(rawHeader))
+                {
+                    rawHeader = rawHeader
+                        .Replace("\u00A0", "") // non-breaking space
+                        .Replace("“", "").Replace("”", "")//smart quotes
+                        .Replace("\"", "") // normal quotes
+                        .Trim();
+                }
+
+                if (string.IsNullOrWhiteSpace(rawHeader))
+                    rawHeader = $"Column{i + 1}"; // fallback name
+
+                dt.Columns[i].ColumnName = rawHeader;
+                Log(connStr, $"Parsed header: '{rawHeader}'");
+            }
+
+            // Remove header row only (don't delete it twice)
+            dt.Rows.RemoveAt(headerIndex);
+
+            // If you need to remove rows before header (rarely needed, be careful) - BRING IT BACK 
+            if (headerIndex > 0)
+            {
+                for (int i = 0; i < headerIndex; i++)
+                {
+                    if (dt.Rows.Count > 0)
+                        dt.Rows.RemoveAt(0);
+                }
+            }
+            dt.AcceptChanges();
+
+            if (dt.Rows.Count > 0)
+            {
+                dt = dt.AsEnumerable()
+                        .Where(row => row.ItemArray.Any(cell =>
+                            cell != null && !string.IsNullOrWhiteSpace(cell.ToString())))
+                        .CopyToDataTable();
+            }
+
+
+            // Add SourceFileName
+            if (!dt.Columns.Contains("SourceFileName"))
+                dt.Columns.Add("SourceFileName", typeof(string));
+            foreach (DataRow row in dt.Rows)
+                row["SourceFileName"] = Path.GetFileName(filePath);
+
+            // Validate required columns (optional)
+            var requiredCols = colMappings.Where(m => m.IsRequired).Select(m => m.IncomingColumn).ToList();
+            foreach (var col in requiredCols)
+            {
+                bool found = dt.Columns.Cast<DataColumn>().Any(c => string.Equals(c.ColumnName, col, StringComparison.OrdinalIgnoreCase));
+                if (!found)
+                    throw new Exception($"Missing required column in Excel file: {col}");
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        LogError(connStr, "Excel Read Error", $"Failed to load Excel file: {filePath}. {ex.Message}");
+        throw;
+    }
+
+    return dt;
+}
+
+public void MapColumns(DataTable dt, List<ColumnMapping> mappings, string connStr)
+{
     foreach (var map in mappings)
     {
         if (dt.Columns.Contains(map.IncomingColumn))
@@ -236,6 +421,63 @@ public void LogSchemaDifferences(DataTable dt, string tableName, string sourceFi
     }
 }
 
+public void LogTruncationIssues(DataTable dt, string tableName, SqlConnection conn)
+{
+    // Get destination column limits from database
+    var colLengths = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+    using (SqlCommand cmd = new SqlCommand($@"
+        SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = @TableName AND CHARACTER_MAXIMUM_LENGTH IS NOT NULL", conn))
+    {
+        cmd.Parameters.AddWithValue("@TableName", tableName);
+        using (SqlDataReader reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+            {
+                string colName = reader.GetString(0);
+                int maxLength = reader.IsDBNull(1) ? 0 : reader.GetInt32(1);
+                colLengths[colName] = maxLength;
+            }
+        }
+    }
+
+    // Check each row
+    foreach (DataRow row in dt.Rows)
+    {
+        foreach (DataColumn col in dt.Columns)
+        {
+            if (col.DataType != typeof(string)) continue;
+
+            if (!colLengths.TryGetValue(col.ColumnName, out int maxAllowed)) continue;
+
+            string value = row[col]?.ToString();
+            if (string.IsNullOrEmpty(value)) continue;
+
+            if (value.Length > maxAllowed)
+            {
+                // Create a row identifier if needed
+                string rowId = row.Table.Columns.Contains("SourceFileName") ? row["SourceFileName"].ToString() : "UnknownFile";
+
+                using (SqlCommand logCmd = new SqlCommand(@"
+                    INSERT INTO ETL.Truncation_Log 
+                    (TableName, ColumnName, RowIdentifier, ActualLength, MaxAllowedLength, ValueTruncated) 
+                    VALUES (@TableName, @ColumnName, @RowIdentifier, @ActualLength, @MaxAllowedLength, @ValueTruncated)", conn))
+                {
+                    logCmd.Parameters.AddWithValue("@TableName", tableName);
+                    logCmd.Parameters.AddWithValue("@ColumnName", col.ColumnName);
+                    logCmd.Parameters.AddWithValue("@RowIdentifier", rowId);
+                    logCmd.Parameters.AddWithValue("@ActualLength", value.Length);
+                    logCmd.Parameters.AddWithValue("@MaxAllowedLength", maxAllowed);
+                    logCmd.Parameters.AddWithValue("@ValueTruncated", value.Substring(0, Math.Min(255, value.Length))); // Just a preview
+
+                    logCmd.ExecuteNonQuery();
+                }
+            }
+        }
+    }
+}
+
 public void BulkInsert(DataTable dt, string tableName, SqlConnection conn)
 {
     LogSchemaDifferences(dt, tableName, dt.Rows[0]["SourceFileName"].ToString(), conn);
@@ -256,6 +498,27 @@ public void BulkInsert(DataTable dt, string tableName, SqlConnection conn)
                 bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
         }
         bulk.WriteToServer(dt);
+    }
+}
+
+public void RunPostLoadProcedure(SqlConnection conn, string procedureName)
+{
+    if (string.IsNullOrWhiteSpace(procedureName))
+        return;
+
+    try
+    {
+        using (SqlCommand cmd = new SqlCommand(procedureName, conn))
+        {
+            cmd.CommandType = CommandType.StoredProcedure;
+            cmd.ExecuteNonQuery();
+        }
+
+        Log(conn.ConnectionString, $"Post-load procedure executed: {procedureName}");
+    }
+    catch (Exception ex)
+    {
+        LogError(conn.ConnectionString, $"Failed to execute post-load proc: {procedureName}", ex.Message);
     }
 }
 
@@ -289,7 +552,7 @@ public void LogError(string connStr, string errorType, string message)
     using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL.Claims_Error_Log (LogTimestamp, Message) VALUES (@ts, @msg)", conn))
     {
         cmd.Parameters.AddWithValue("@ts", DateTime.Now);
-        cmd.Parameters.AddWithValue("@msg", message);
+        cmd.Parameters.AddWithValue("@msg", $"{errorType}: {message}");
         conn.Open();
         cmd.ExecuteNonQuery();
     }
