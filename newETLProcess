@@ -557,3 +557,15 @@ public void LogError(string connStr, string errorType, string message)
         cmd.ExecuteNonQuery();
     }
 }
+
+
+-- Combine logs with separators
+SELECT 
+  '==== CLAIMS LOG ====' + CHAR(13) + 
+  ISNULL(STRING_AGG(CONVERT(VARCHAR(MAX), Message), CHAR(13)), 'No logs') + CHAR(13) +
+  '==== ERRORS ====' + CHAR(13) +
+  ISNULL((SELECT STRING_AGG(CONVERT(VARCHAR(MAX), Message), CHAR(13)) FROM ETL.Claims_Error_Log), 'No errors') + CHAR(13) +
+  '==== SCHEMA CHANGES ====' + CHAR(13) +
+  ISNULL((SELECT STRING_AGG(CONVERT(VARCHAR(MAX), ColumnName + ': ' + ISNULL(SuggestedAlterStatement, '')) , CHAR(13)) 
+          FROM ETL.Claim_File_Schema_History), 'No schema changes') AS FullLog;
+
