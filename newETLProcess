@@ -1,35 +1,169 @@
-private void ValidateRequiredColumns(DataTable dt, List<ColumnMapping> colMappings, string fileType, string filePath)
-{
-    var requiredCols = colMappings
-        .Where(m => m.IsRequired)
-        .Select(m => m.IncomingColumn)
-        .ToList();
+ private DataTable ReadCsv(string filePath, string delimiter, List<ColumnMapping> colMappings, string connStr)
+ {
+     DataTable dt = new DataTable();
+     string sourceFileName = Path.GetFileName(filePath);
 
-    foreach (var col in requiredCols)
-    {
-        bool found = dt.Columns.Cast<DataColumn>()
-                        .Any(c => string.Equals(c.ColumnName, col, StringComparison.OrdinalIgnoreCase));
-        if (!found)
-            throw new Exception($"Missing required column in {fileType} file: {col} in {filePath}");
-    }
-}
+     using (StreamReader sr = new StreamReader(filePath))
+     {
+         string headerLine = sr.ReadLine();
+         if (headerLine == null) throw new Exception("CSV file is empty.");
 
-private void RemoveEmptyRows(DataTable dt)
-{
-    if (dt.Rows.Count > 0)
-    {
-        var nonEmptyRows = dt.AsEnumerable()
-            .Where(row => row.ItemArray.Any(cell =>
-                cell != null && !string.IsNullOrWhiteSpace(cell.ToString())));
+         bool isQuotedSingleColumn = !headerLine.Contains(delimiter) && headerLine.StartsWith("\"") && headerLine.EndsWith("\"");
 
-        dt = nonEmptyRows.Any() ? nonEmptyRows.CopyToDataTable() : dt.Clone();
-    }
-}
+         if (isQuotedSingleColumn)
+         {
+             string header = headerLine.Trim().Trim('"');
+             dt.Columns.Add(header);
+             dt.Columns.Add("SourceFileName");
 
-private void AddSourceFileNameColumn(DataTable dt, string filePath)
-{
-    if (!dt.Columns.Contains("SourceFileName"))
-        dt.Columns.Add("SourceFileName", typeof(string));
-    foreach (DataRow row in dt.Rows)
-        row["SourceFileName"] = Path.GetFileName(filePath);
-}
+             while (!sr.EndOfStream)
+             {
+                 string line = sr.ReadLine()?.Trim().Trim('"');
+                 if (!string.IsNullOrWhiteSpace(line))
+                 {
+                     DataRow row = dt.NewRow();
+                     row[header] = line;
+                     row["SourceFileName"] = sourceFileName;
+                     dt.Rows.Add(row);
+                 }
+             }
+         }
+         else
+         {
+             string[] headers = headerLine.Split(delimiter.ToCharArray());
+             foreach (string header in headers)
+                 dt.Columns.Add(header.Trim('"'));
+
+             dt.Columns.Add("SourceFileName");
+
+             // Check for required columns from mapping (commented out for now)
+             ValidateRequiredColumns(dt, colMappings, "CSV", filePath);
+             
+
+             while (!sr.EndOfStream)
+             {
+                 string[] values = sr.ReadLine()?.Split(delimiter.ToCharArray());
+                 if (values != null && values.Any(v => !string.IsNullOrWhiteSpace(v)))
+                 {
+                     if (values.Length > headers.Length)
+                     {
+                         LogError(connStr, "CSV Format Warning", $"Too many values in line of {sourceFileName}, Truncating extras.");
+                     }
+                     DataRow row = dt.NewRow();
+                     for (int i = 0; i < headers.Length; i++)
+                     {
+                         if (i < values.Length && !string.IsNullOrWhiteSpace(values[i]))
+                             row[i] = values[i].Trim('"');
+                         else
+                             row[i] = DBNull.Value;
+                     }
+
+                     // Add SourceFileName
+                     AddSourceFileNameColumn(dt, filePath);
+
+                     //Remove empty rows
+                     RemoveEmptyRows(dt);
+                 }
+             }
+         }
+     }
+
+     return dt;
+ }
+
+ private DataTable ReadExcel(string filePath, TableMapping mapping, List<ColumnMapping> colMappings, string connStr)
+ {
+     DataTable dt = new DataTable();
+     string ext = Path.GetExtension(filePath);
+     string hdr = "No";
+     string sheet = mapping.SheetName?.TrimEnd('$') + "$";
+     string hdrRowIndex = mapping.HeaderRowIndex.ToString();
+
+     string connStrExcel = $"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={filePath};" +
+                           $"Extended Properties=\"Excel 12.0 Xml;HDR={hdr};IMEX=1\"";
+
+     try
+     {
+         using (OleDbConnection excelConn = new OleDbConnection(connStrExcel))
+         {
+             excelConn.Open();
+
+             // Optional: Validate sheet exists
+             DataTable sheets = excelConn.GetOleDbSchemaTable(OleDbSchemaGuid.Tables, null);
+             foreach (DataRow row in sheets.Rows)
+             {
+                 string sheetName = row["TABLE_NAME"].ToString();
+                 Log(connStr, $"Found sheet: {sheetName}");
+             }
+
+
+
+             //bool sheetExists = sheets.AsEnumerable().Any(r => r["TABLE_NAME"].ToString().Equals(sheet, StringComparison.OrdinalIgnoreCase));
+
+             string expectedSheet = mapping.SheetName.TrimEnd('$') + "$";
+
+             // Try to match ignoring quotes and casing
+             string matchedSheetName = sheets.AsEnumerable()
+                 .Select(r => r["TABLE_NAME"].ToString().Trim('\''))
+                 .FirstOrDefault(name => name.Equals(expectedSheet, StringComparison.OrdinalIgnoreCase));
+
+             if (matchedSheetName == null)
+             {
+                 LogError(connStr, "Excel Sheet Error", $"Sheet '{expectedSheet}' not found in file: {Path.GetFileName(filePath)}. Available sheets: " +
+                     string.Join(", ", sheets.AsEnumerable().Select(r => r["TABLE_NAME"].ToString())));
+                 throw new Exception($"Sheet '{expectedSheet}' not found.");
+             }
+
+             string query = $"SELECT * FROM [{matchedSheetName}]";
+
+             using (OleDbDataAdapter da = new OleDbDataAdapter(query, excelConn))
+             {
+                 da.Fill(dt);
+             }
+
+             // Promote the header row
+             int headerIndex = mapping.HeaderRowIndex - 1;
+             if (dt.Rows.Count <= headerIndex)
+                 throw new Exception($"HeaderRowIndex {mapping.HeaderRowIndex} exceeds total rows in Excel sheet.");
+
+             DataRow headerRow = dt.Rows[headerIndex];
+             for (int i = 0; i < dt.Columns.Count; i++)
+             {
+                 var rawHeader = headerRow[i]?.ToString()?.Trim();
+                 if (string.IsNullOrWhiteSpace(rawHeader))
+                     rawHeader = $"Column{i + 1}";
+                 dt.Columns[i].ColumnName = rawHeader;
+             }
+
+             // Remove header row only (don't delete it twice)
+             dt.Rows.RemoveAt(headerIndex);
+
+             // If you need to remove rows before header (rarely needed, be careful) - BRING IT BACK 
+             if (headerIndex > 0)
+             {
+                 for (int i = 0; i < headerIndex; i++)
+                 {
+                     if (dt.Rows.Count > 0)
+                         dt.Rows.RemoveAt(0);
+                 }
+             }
+             dt.AcceptChanges();
+
+             //Remove empty Rows
+             RemoveEmptyRows(dt);
+
+             // Add SourceFileName
+             AddSourceFileNameColumn(dt, filePath);
+
+             // Validate required columns (optional)
+             ValidateRequiredColumns(dt, colMappings, "Excel", filePath);
+         }
+     }
+     catch (Exception ex)
+     {
+         LogError(connStr, "Excel Read Error", $"Failed to load Excel file: {filePath}. {ex.Message}");
+         throw;
+     }
+
+     return dt;
+ }
