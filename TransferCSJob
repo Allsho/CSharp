@@ -230,3 +230,119 @@
                 Console.WriteLine($"Error while logging: {ex.Message}");
             }
         }
+
+
+
+Step 1:
+CREATE TABLE FileTransferHistory (
+    FileName NVARCHAR(255),
+    FileHash NVARCHAR(64),
+    FileSize BIGINT,
+    ProcessedDate DATETIME,
+    LastSeenDate DATETIME
+);
+
+ STEP 2: Add Required SSIS Variables
+
+Add this variable:
+
+User::ArchiveDeletePath (e.g., C:\Archive\DeleteAfter7Days\)
+
+Add references to these assemblies (in Script Task):
+
+System.Data
+
+System.Security.Cryptography
+
+System.Data.SqlClient (for DB access)
+
+
+STEP 3: Add C# Utility Functions
+
+private string ComputeFileHash(string filePath)
+{
+    using (var sha = SHA256.Create())
+    using (var stream = File.OpenRead(filePath))
+    {
+        byte[] hashBytes = sha.ComputeHash(stream);
+        return BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
+    }
+}
+
+🔍 Check if File Already Processed:
+private bool IsFileAlreadyProcessed(string hash)
+{
+    string connString = Dts.Connections["YourConnectionManager"].ConnectionString;
+
+    using (SqlConnection conn = new SqlConnection(connString))
+    {
+        conn.Open();
+        using (SqlCommand cmd = new SqlCommand("SELECT COUNT(*) FROM FileTransferHistory WHERE FileHash = @hash", conn))
+        {
+            cmd.Parameters.AddWithValue("@hash", hash);
+            int count = (int)cmd.ExecuteScalar();
+            return count > 0;
+        }
+    }
+}
+
+💾 Save Hash to DB:
+
+private void SaveFileHashToDb(string fileName, string fileHash, long fileSize)
+{
+    string connString = Dts.Connections["YourConnectionManager"].ConnectionString;
+
+    using (SqlConnection conn = new SqlConnection(connString))
+    {
+        conn.Open();
+        using (SqlCommand cmd = new SqlCommand(@"
+            INSERT INTO FileTransferHistory (FileName, FileHash, FileSize, ProcessedDate, LastSeenDate)
+            VALUES (@fileName, @fileHash, @fileSize, GETDATE(), GETDATE())", conn))
+        {
+            cmd.Parameters.AddWithValue("@fileName", fileName);
+            cmd.Parameters.AddWithValue("@fileHash", fileHash);
+            cmd.Parameters.AddWithValue("@fileSize", fileSize);
+            cmd.ExecuteNonQuery();
+        }
+    }
+}
+
+🔁 STEP 4: Modify ProcessFiles and ZipFiles
+
+string hash = ComputeFileHash(file);
+if (IsFileAlreadyProcessed(hash))
+{
+    // Move duplicate to DeleteAfter7Days folder
+    string deletePath = Path.Combine(Dts.Variables["User::ArchiveDeletePath"].Value.ToString(), fileName);
+    File.Move(file, deletePath);
+    Console.WriteLine($"Skipped duplicate file: {fileName}. Moved to DeleteAfter7Days.");
+    LogOperation(fileName, "Skipped", "Duplicate file (hash match). Moved to delete folder.");
+    continue;
+}
+
+// Save hash to DB before proceeding
+FileInfo info = new FileInfo(file);
+SaveFileHashToDb(fileName, hash, info.Length);
+
+📦 In ZipFiles, do similar inside the foreach (string file...) loop:
+Add before archive.CreateEntryFromFile:
+
+string hash = ComputeFileHash(file);
+if (IsFileAlreadyProcessed(hash))
+{
+    string deletePath = Path.Combine(Dts.Variables["User::ArchiveDeletePath"].Value.ToString(), fileName);
+    File.Move(file, deletePath);
+    Console.WriteLine($"Skipped duplicate (zip): {fileName}. Moved to DeleteAfter7Days.");
+    LogOperation(fileName, "Skipped", "Duplicate file (hash match).");
+    continue;
+}
+
+FileInfo info = new FileInfo(file);
+SaveFileHashToDb(fileName, hash, info.Length);
+
+
+✅ STEP 5: Final Script Additions
+using System.Data.SqlClient;
+using System.Security.Cryptography;
+using System.IO.Compression;
+using System.Diagnostics;
