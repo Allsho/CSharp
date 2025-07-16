@@ -313,3 +313,149 @@ private void LogOperation(string fileName, string status, string logMessage)
         Console.WriteLine($"Error while logging to DB: {ex.Message}");
     }
 }
+
+private void ProcessFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, bool isMove, string archiveDeleteFolder)
+{
+    try
+    {
+        if (!Directory.Exists(sourceFolder))
+            throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
+
+        if (!Directory.Exists(destinationFolder))
+            throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
+
+        string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+        string[] files = Directory.GetFiles(sourceFolder, filePattern);
+
+        foreach (string file in files)
+        {
+            string fileName = Path.GetFileName(file);
+
+            // 1. Check exclusion first
+            if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                Console.WriteLine($"Excluded file: {fileName}");
+                LogOperation(fileName, "Excluded", "File excluded based on exclusion list.");
+                continue;
+            }
+
+            // 2. Compute hash AFTER exclusion check
+            string hash = ComputeFileHash(file);
+            if (IsFileAlreadyProcessed(hash))
+            {
+                string deletePath = Path.Combine(archiveDeleteFolder, fileName);
+                File.Move(file, deletePath);
+                Console.WriteLine($"Skipped duplicate file: {fileName}. Moved to DeleteAfter7Days.");
+                LogOperation(fileName, "Skipped", "Duplicate file (hash match). Moved to delete folder.");
+                continue;
+            }
+
+            // 3. Save to DB now that it passed checks
+            FileInfo info = new FileInfo(file);
+            SaveFileHashToDb(fileName, hash, info.Length);
+
+            string destinationFile = Path.Combine(destinationFolder, fileName);
+            try
+            {
+                if (isMove)
+                {
+                    File.Move(file, destinationFile);
+                    Console.WriteLine($"Moved: {fileName}");
+                    LogOperation(fileName, "Success", "File moved successfully.");
+                }
+                else
+                {
+                    File.Copy(file, destinationFile, true);
+                    Console.WriteLine($"Copied: {fileName}");
+                    LogOperation(fileName, "Success", "File copied successfully.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error processing file: {fileName}. Error: {ex.Message}");
+                LogOperation(fileName, "Failure", ex.Message);
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error in ProcessFiles(): {ex.Message}");
+        LogOperation("N.A", "Failure", ex.Message);
+    }
+}
+
+
+
+
+private void ZipFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, string zipName, string archiveDeleteFolder)
+{
+    try
+    {
+        if (!Directory.Exists(sourceFolder))
+            throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
+
+        if (!Directory.Exists(destinationFolder))
+            throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
+
+        // Convert exclusion list into array
+        string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+
+        // Get files matching pattern
+        string[] files = Directory.GetFiles(sourceFolder, filePattern);
+
+        // Create zip file with timestamped name
+        string zipFileName = Path.Combine(destinationFolder, $"{zipName}_{DateTime.Now:yyyyMM}.zip");
+
+        using (ZipArchive archive = ZipFile.Open(zipFileName, ZipArchiveMode.Create))
+        {
+            foreach (string file in files)
+            {
+                string fileName = Path.GetFileName(file);
+
+                // 1. Exclusion check
+                if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
+                {
+                    Console.WriteLine($"Excluded file: {fileName}");
+                    LogOperation(fileName, "Excluded", "File excluded based on exclusion list.");
+                    continue;
+                }
+
+                // 2. Compute hash
+                string hash = ComputeFileHash(file);
+                if (IsFileAlreadyProcessed(hash))
+                {
+                    string deletePath = Path.Combine(archiveDeleteFolder, fileName);
+                    File.Move(file, deletePath);
+                    Console.WriteLine($"Skipped duplicate (zip): {fileName}. Moved to DeleteAfter7Days.");
+                    LogOperation(fileName, "Skipped", "Duplicate file (hash match). Moved to delete folder.");
+                    continue;
+                }
+
+                // 3. Save hash to DB
+                FileInfo info = new FileInfo(file);
+                SaveFileHashToDb(fileName, hash, info.Length);
+
+                // 4. Add to zip
+                try
+                {
+                    archive.CreateEntryFromFile(file, fileName);
+                    Console.WriteLine($"Zipped: {fileName}");
+                    LogOperation(fileName, "Success", "File compressed and zipped.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Error zipping file: {fileName}. Error: {ex.Message}");
+                    LogOperation(fileName, "Failure", ex.Message);
+                }
+            }
+        }
+
+        Console.WriteLine($"Zip file created: {zipFileName}");
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error in ZipFiles(): {ex.Message}");
+        LogOperation("N/A", "Failure", ex.Message);
+    }
+}
+
