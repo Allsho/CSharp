@@ -445,3 +445,51 @@ class Config
     public bool HasFiles;
 }
 
+
+
+private void WriteLogToDatabase(int mappingID, string actionType, string fileName, string status, string message)
+{
+    string connStr = Dts.Variables["User::LogConnectionString"].Value.ToString();
+    using (SqlConnection conn = new SqlConnection(connStr))
+    {
+        conn.Open();
+        string query = @"INSERT INTO FileLogTable (MappingID, ActionType, FileName, Status, LogMessage, LoggedAt)
+                         VALUES (@MappingID, @ActionType, @FileName, @Status, @Message, GETDATE())";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@MappingID", mappingID);
+            cmd.Parameters.AddWithValue("@ActionType", actionType);
+            cmd.Parameters.AddWithValue("@FileName", fileName);
+            cmd.Parameters.AddWithValue("@Status", status);
+            cmd.Parameters.AddWithValue("@Message", message);
+            cmd.ExecuteNonQuery();
+        }
+    }
+}
+
+
+private bool IsAlreadyProcessed(string fileName, int mappingID)
+{
+    string connStr = Dts.Variables["User::LogConnectionString"].Value.ToString();
+    using (SqlConnection conn = new SqlConnection(connStr))
+    {
+        conn.Open();
+        string query = @"SELECT COUNT(*) FROM FileLogTable 
+                         WHERE FileName = @FileName AND MappingID = @MappingID AND Status = 'Success'";
+
+        using (SqlCommand cmd = new SqlCommand(query, conn))
+        {
+            cmd.Parameters.AddWithValue("@FileName", fileName);
+            cmd.Parameters.AddWithValue("@MappingID", mappingID);
+            return (int)cmd.ExecuteScalar() > 0;
+        }
+    }
+}
+
+if (IsAlreadyProcessed(fileName, config.MappingID))
+{
+    Console.WriteLine($"Skipping already processed file: {fileName}");
+    LogOperation(config, fileName, "AlreadyProcessed", "File already moved/copied this month.");
+    continue;
+}
