@@ -1,57 +1,107 @@
-using System;
-using System.Data;
-using Microsoft.SqlServer.Dts.Runtime;
-using System.Windows.Forms;  // For MessageBox (for testing)
+CREATE TABLE ETL.Email_Config (
+    ConfigName NVARCHAR(50) PRIMARY KEY,
+    ConfigValue NVARCHAR(MAX)
+);
 
-public void Main()
+INSERT INTO ETL.Email_Config (ConfigName, ConfigValue)
+VALUES 
+('SMTP_Server', 'smtp.yourdomain.com'),
+('SMTP_Port', '25'),
+('From_Email', 'etl-alerts@yourdomain.com'),
+('To_Email', 'team@yourdomain.com'),
+('SendOnSuccess', '1'),
+('SendOnFailureOnly', '0'),
+('EnableSSL', '0');
+
+
+CREATE PROCEDURE ETL.usp_Build_Email_Summary
+    @MappingId INT,
+    @Subject NVARCHAR(255) OUTPUT,
+    @Body NVARCHAR(MAX) OUTPUT
+AS
+BEGIN
+    DECLARE @PayorName NVARCHAR(100) = (SELECT TOP 1 PayorName FROM ETL.Table_Mapping WHERE MappingID = @MappingId)
+    DECLARE @StartTime DATETIME = (SELECT MIN(LogTimestamp) FROM ETL.Claims_Log WHERE Message LIKE '%ETL Process Started%')
+    DECLARE @EndTime DATETIME = (SELECT MAX(LogTimestamp) FROM ETL.Claims_Log WHERE Message LIKE '%ETL Process Completed%')
+
+    SET @Subject = CONCAT('ETL File Ingestion Summary for ', @PayorName, ' - ', FORMAT(GETDATE(), 'yyyy-MM-dd HH:mm'))
+
+    DECLARE @NewColumns NVARCHAR(MAX) = ''
+    SELECT @NewColumns = STRING_AGG(
+        CONCAT('- Table: ', TableName, ', Column: ', ColumnName, 
+               ', Suggested: ALTER TABLE ', TableName, ' ADD [', ColumnName, '] NVARCHAR(255);'),
+        CHAR(13) + CHAR(10))
+    FROM ETL.Claim_File_Schema_History
+    WHERE ColumnMapped = 0 AND LogTimestamp >= @StartTime
+
+    DECLARE @Truncation NVARCHAR(MAX) = ''
+    SELECT @Truncation = STRING_AGG(
+        CONCAT('- Table: ', TableName, ', Column: ', ColumnName, ', Max: ', MaxAllowedLength, ', Actual: ', ActualLength),
+        CHAR(13) + CHAR(10))
+    FROM ETL.Truncation_Log
+    WHERE LogTimestamp >= @StartTime
+
+    DECLARE @Errors NVARCHAR(MAX) = ''
+    SELECT @Errors = STRING_AGG(
+        CONCAT('- ', Message),
+        CHAR(13) + CHAR(10))
+    FROM ETL.Claims_Error_Log
+    WHERE LogTimestamp >= @StartTime
+
+    SET @Body = 
+    CONCAT(
+    'Hello Team,', CHAR(13)+CHAR(10), CHAR(13)+CHAR(10),
+    'The ETL ingestion process for payor "', @PayorName, '" has completed.', CHAR(13)+CHAR(10),
+    'Start Time: ', FORMAT(@StartTime, 'yyyy-MM-dd HH:mm:ss'), CHAR(13)+CHAR(10),
+    'End Time: ', FORMAT(@EndTime, 'yyyy-MM-dd HH:mm:ss'), CHAR(13)+CHAR(10),
+    CHAR(13)+CHAR(10),
+    '⚠️ New Columns Detected:', CHAR(13)+CHAR(10),
+    ISNULL(@NewColumns, 'None'), CHAR(13)+CHAR(10), CHAR(13)+CHAR(10),
+    '🚫 Truncation Warnings:', CHAR(13)+CHAR(10),
+    ISNULL(@Truncation, 'None'), CHAR(13)+CHAR(10), CHAR(13)+CHAR(10),
+    '❌ Errors Logged:', CHAR(13)+CHAR(10),
+    ISNULL(@Errors, 'None'), CHAR(13)+CHAR(10), CHAR(13)+CHAR(10),
+    'Status: ', CASE WHEN @Errors IS NULL THEN '✅ Success' ELSE '⚠️ Issues Detected' END, CHAR(13)+CHAR(10),
+    CHAR(13)+CHAR(10),
+    'Regards,', CHAR(13)+CHAR(10),
+    'ETL Automation System'
+    )
+END
+
+
+public void SendEmailFromDb(string subject, string body)
 {
-    try
+    string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+    string smtpServer = GetConfigValue(connStr, "SMTP_Server");
+    string port = GetConfigValue(connStr, "SMTP_Port");
+    string fromEmail = GetConfigValue(connStr, "From_Email");
+    string toEmail = GetConfigValue(connStr, "To_Email");
+    string enableSSL = GetConfigValue(connStr, "EnableSSL");
+
+    MailMessage mail = new MailMessage();
+    mail.From = new MailAddress(fromEmail);
+    mail.To.Add(toEmail);
+    mail.Subject = subject;
+    mail.Body = body;
+
+    SmtpClient smtp = new SmtpClient(smtpServer);
+    smtp.Port = int.Parse(port);
+    smtp.EnableSsl = enableSSL == "1";
+    smtp.Send(mail);
+}
+
+public string GetConfigValue(string connStr, string configName)
+{
+    using (SqlConnection conn = new SqlConnection(connStr))
+    using (SqlCommand cmd = new SqlCommand("SELECT ConfigValue FROM ETL.Email_Config WHERE ConfigName = @name", conn))
     {
-        // Fetch the Recordset variable (User::TableStatus) which contains the query result
-        object obj = Dts.Variables["User::TableStatus"].Value;
-
-        // Check if the object is null
-        if (obj == null)
-        {
-            MessageBox.Show("The Recordset variable 'User::TableStatus' is null.");
-            Dts.TaskResult = (int)ScriptResults.Failure;
-            return;
-        }
-
-        // Create a DataTable to hold the data
-        DataTable dt = new DataTable();
-
-        // Use OleDbDataAdapter to load the Recordset into a DataTable
-        OleDbDataAdapter oleDbAdapter = new OleDbDataAdapter();
-        oleDbAdapter.Fill(dt, (System.Data.OleDb.OleDbDataReader)obj);
-
-        // Check if rows are populated
-        if (dt.Rows.Count > 0)
-        {
-            // Loop through the DataTable to verify that data is loaded correctly
-            foreach (DataRow row in dt.Rows)
-            {
-                // For debugging: Show the SchemaName, TableName, DesignAnalysis, and HasEffectiveKey in a message box
-                string schemaName = row["SchemaName"].ToString();
-                string tableName = row["TableName"].ToString();
-                string designAnalysis = row["DesignAnalysis"].ToString();
-                string hasEffectiveKey = row["HasEffectiveKey"].ToString();
-
-                // Display the values for debugging
-                MessageBox.Show($"Schema: {schemaName}, Table: {tableName}, Design Analysis: {designAnalysis}, Has Effective Key: {hasEffectiveKey}");
-            }
-        }
-        else
-        {
-            MessageBox.Show("The DataTable has no rows.");
-        }
-
-        Dts.TaskResult = (int)ScriptResults.Success;
-    }
-    catch (Exception ex)
-    {
-        // For debugging: Show any exception message in a message box
-        MessageBox.Show("An error occurred: " + ex.Message);
-        Dts.TaskResult = (int)ScriptResults.Failure;
+        cmd.Parameters.AddWithValue("@name", configName);
+        conn.Open();
+        return (string)cmd.ExecuteScalar();
     }
 }
+
+
+DECLARE @subject NVARCHAR(255), @body NVARCHAR(MAX);
+EXEC ETL.usp_Build_Email_Summary @MappingId = 101, @Subject = @subject OUTPUT, @Body = @body OUTPUT;
+SELECT @subject AS Subject, @body AS Body;
