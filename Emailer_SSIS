@@ -105,3 +105,118 @@ public string GetConfigValue(string connStr, string configName)
 DECLARE @subject NVARCHAR(255), @body NVARCHAR(MAX);
 EXEC ETL.usp_Build_Email_Summary @MappingId = 101, @Subject = @subject OUTPUT, @Body = @body OUTPUT;
 SELECT @subject AS Subject, @body AS Body;
+
+
+
+
+public void Main()
+{
+    string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+    string basePath = Dts.Variables["User::prmRootPath"].Value.ToString();
+    string idList = Dts.Variables["User::FilteredMappingIDs"].Value.ToString();
+
+    try
+    {
+        Log(connStr, "ETL Process Started");
+
+        List<TableMapping> mappings = GetTableMappings(connStr);
+
+        using (SqlConnection conn = new SqlConnection(connStr))
+        {
+            conn.Open();
+            foreach (var mapping in mappings)
+            {
+                List<ColumnMapping> columnMappings = GetColumnMappings(conn, mapping.TargetTable);
+                ProcessFiles(conn, mapping, columnMappings, basePath);
+            }
+        }
+
+        Log(connStr, "ETL Process Completed");
+    }
+    catch (Exception ex)
+    {
+        LogError(connStr, "General Error", ex.Message);
+    }
+    finally
+    {
+        // ✅ Call the email function with MappingIds after ETL
+        SendSummaryEmail(connStr, idList);
+    }
+
+    Dts.TaskResult = (int)ScriptResults.Success;
+}
+
+
+public void SendSummaryEmail(string connStr, string mappingIdList)
+{
+    foreach (string id in mappingIdList.Split(','))
+    {
+        if (int.TryParse(id.Trim(), out int mappingId))
+        {
+            try
+            {
+                string subject = string.Empty;
+                string body = string.Empty;
+
+                using (SqlConnection conn = new SqlConnection(connStr))
+                using (SqlCommand cmd = new SqlCommand("ETL.usp_Build_Email_Summary", conn))
+                {
+                    cmd.CommandType = CommandType.StoredProcedure;
+                    cmd.Parameters.AddWithValue("@MappingId", mappingId);
+
+                    SqlParameter subjectParam = new SqlParameter("@Subject", SqlDbType.NVarChar, 255)
+                    {
+                        Direction = ParameterDirection.Output
+                    };
+                    SqlParameter bodyParam = new SqlParameter("@Body", SqlDbType.NVarChar, -1)
+                    {
+                        Direction = ParameterDirection.Output
+                    };
+
+                    cmd.Parameters.Add(subjectParam);
+                    cmd.Parameters.Add(bodyParam);
+
+                    conn.Open();
+                    cmd.ExecuteNonQuery();
+
+                    subject = subjectParam.Value?.ToString();
+                    body = bodyParam.Value?.ToString();
+                }
+
+                SendEmail(subject, body);
+            }
+            catch (Exception ex)
+            {
+                LogError(connStr, $"Email Error for MappingId {mappingId}", ex.Message);
+            }
+        }
+    }
+}
+
+
+public void SendEmail(string subject, string body)
+{
+    try
+    {
+        using (System.Net.Mail.SmtpClient smtp = new System.Net.Mail.SmtpClient("smtp.yourdomain.com"))
+        {
+            smtp.Port = 587; // Or whatever your SMTP requires
+            smtp.Credentials = new System.Net.NetworkCredential("username", "password");
+            smtp.EnableSsl = true;
+
+            var message = new System.Net.Mail.MailMessage();
+            message.From = new System.Net.Mail.MailAddress("etl@yourdomain.com");
+            message.To.Add("team@yourdomain.com"); // Add your team email list
+            message.Subject = subject;
+            message.Body = body;
+
+            smtp.Send(message);
+        }
+    }
+    catch (Exception ex)
+    {
+        // Log but don’t fail the package if email fails
+        LogError("your_connection_string", "SMTP Send Error", ex.Message);
+    }
+}
+
