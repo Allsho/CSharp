@@ -89,7 +89,7 @@ public void SendEmailFromDb(string subject, string body)
     smtp.EnableSsl = enableSSL == "1";
     smtp.Send(mail);
 }
-
+ 
 public string GetConfigValue(string connStr, string configName)
 {
     using (SqlConnection conn = new SqlConnection(connStr))
