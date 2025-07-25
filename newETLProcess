@@ -1,40 +1,35 @@
-private void ConvertExcelDateSerialsToDate(DataTable dt)
+foreach (DataRow row in dataTable.Rows)
 {
-    foreach (DataColumn col in dt.Columns)
+    foreach (var columnMap in mapping)
     {
-        string colName = col.ColumnName.ToLower();
-        if (colName.Contains("date") || colName.Contains("dob") || colName.Contains("start") || colName.Contains("end"))
+        var value = row[columnMap.IncomingColumnName]?.ToString()?.Trim();
+
+        if (string.IsNullOrWhiteSpace(value))
         {
-            foreach (DataRow row in dt.Rows)
+            if (columnMap.IsRequired)
             {
-                var value = row[col];
-
-                if (value == null || value == DBNull.Value)
-                    continue;
-
-                string valStr = value.ToString().Trim();
-
-                // If already a valid DateTime string, leave it alone
-                if (DateTime.TryParse(valStr, out _))
-                    continue;
-
-                // Try parsing Excel serials
-                if (double.TryParse(valStr, out double serialVal))
-                {
-                    if (serialVal >= 10000 && serialVal <= 60000)
-                    {
-                        try
-                        {
-                            var converted = DateTime.FromOADate(serialVal);
-                            row[col] = converted.ToString("yyyy-MM-dd");
-                        }
-                        catch
-                        {
-                            // Ignore bad conversions
-                        }
-                    }
-                }
+                // Log or flag missing required field
             }
+            continue;
+        }
+
+        switch (columnMap.DataType?.ToUpper())
+        {
+            case "DATETIME":
+                row[columnMap.StandardizedColumnName] = ConvertExcelDate(value);
+                break;
+
+            case "INT":
+                row[columnMap.StandardizedColumnName] = int.TryParse(value, out var i) ? i : (int?)null;
+                break;
+
+            case "DECIMAL":
+                row[columnMap.StandardizedColumnName] = decimal.TryParse(value, out var d) ? d : (decimal?)null;
+                break;
+
+            default: // VARCHAR or unknown
+                row[columnMap.StandardizedColumnName] = value;
+                break;
         }
     }
 }
