@@ -1,28 +1,38 @@
-string ext = Path.GetExtension(filePath).ToLower();
-string excelVersion = ext == ".xls" ? "Excel 8.0" : "Excel 12.0 Xml";
-string connStrExcel = $"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={filePath};" +
-                      $"Extended Properties=\"{excelVersion};HDR=No;IMEX=1\"";
-
-
-ConvertExcelDateSerialsToDate(dt);
-
-
 private void ConvertExcelDateSerialsToDate(DataTable dt)
 {
     foreach (DataColumn col in dt.Columns)
     {
-        if (col.ColumnName.ToLower().Contains("date"))
+        string colName = col.ColumnName.ToLower();
+        if (colName.Contains("date") || colName.Contains("dob") || colName.Contains("start") || colName.Contains("end"))
         {
             foreach (DataRow row in dt.Rows)
             {
-                if (double.TryParse(row[col]?.ToString(), out double serial) &&
-                    serial > 10000 && serial < 60000) // likely a date
+                var value = row[col];
+
+                if (value == null || value == DBNull.Value)
+                    continue;
+
+                string valStr = value.ToString().Trim();
+
+                // If already a valid DateTime string, leave it alone
+                if (DateTime.TryParse(valStr, out _))
+                    continue;
+
+                // Try parsing Excel serials
+                if (double.TryParse(valStr, out double serialVal))
                 {
-                    try
+                    if (serialVal >= 10000 && serialVal <= 60000)
                     {
-                        row[col] = DateTime.FromOADate(serial).ToString("yyyy-MM-dd");
+                        try
+                        {
+                            var converted = DateTime.FromOADate(serialVal);
+                            row[col] = converted.ToString("yyyy-MM-dd");
+                        }
+                        catch
+                        {
+                            // Ignore bad conversions
+                        }
                     }
-                    catch { /* log if needed */ }
                 }
             }
         }
