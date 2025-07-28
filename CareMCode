@@ -1,0 +1,91 @@
+using System;
+using System.Data;
+using System.Data.SqlClient;
+using System.IO;
+using Microsoft.SqlServer.Dts.Runtime;
+
+public void Main()
+{
+    string connectionString = "Data Source=YourServer;Initial Catalog=YourDB;Integrated Security=SSPI;";
+    string storedProcName = "YourStoredProcName";
+    string fileBaseName = "TheNameIllCallIt";
+    string folderPath = @"C:\Exports\";  // Make sure SSIS has permission
+    long maxFileSize = 1073741824; // 1 GB
+
+    string timestamp = DateTime.Now.ToString("yyyy_MM_dd");
+    int fileIndex = 1;
+    string filePath = Path.Combine(folderPath, $"{timestamp}_{fileBaseName}_{fileIndex}.csv");
+
+    StreamWriter writer = null;
+    long currentFileSize = 0;
+
+    try
+    {
+        using (SqlConnection conn = new SqlConnection(connectionString))
+        {
+            conn.Open();
+            using (SqlCommand cmd = new SqlCommand(storedProcName, conn))
+            {
+                cmd.CommandType = CommandType.StoredProcedure;
+
+                using (SqlDataReader reader = cmd.ExecuteReader())
+                {
+                    DataTable schemaTable = reader.GetSchemaTable();
+
+                    // Build header
+                    string[] columnNames = new string[reader.FieldCount];
+                    for (int i = 0; i < reader.FieldCount; i++)
+                        columnNames[i] = Quote(reader.GetName(i));
+
+                    writer = new StreamWriter(filePath);
+                    string headerLine = string.Join(",", columnNames);
+                    writer.WriteLine(headerLine);
+                    currentFileSize = writer.BaseStream.Length;
+
+                    while (reader.Read())
+                    {
+                        string[] fields = new string[reader.FieldCount];
+                        for (int i = 0; i < reader.FieldCount; i++)
+                            fields[i] = Quote(reader[i].ToString());
+
+                        string line = string.Join(",", fields);
+
+                        // Check if we need to create a new file
+                        if ((currentFileSize + line.Length + 2) > maxFileSize)
+                        {
+                            writer.Flush();
+                            writer.Close();
+                            fileIndex++;
+                            filePath = Path.Combine(folderPath, $"{timestamp}_{fileBaseName}_{fileIndex}.csv");
+                            writer = new StreamWriter(filePath);
+                            writer.WriteLine(headerLine); // repeat header
+                            currentFileSize = writer.BaseStream.Length;
+                        }
+
+                        writer.WriteLine(line);
+                        currentFileSize += System.Text.Encoding.UTF8.GetByteCount(line + Environment.NewLine);
+                    }
+                }
+            }
+        }
+
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+    catch (Exception ex)
+    {
+        Dts.Events.FireError(0, "Script Task", ex.Message, "", 0);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+    }
+    finally
+    {
+        if (writer != null)
+            writer.Close();
+    }
+}
+
+// Helper function to wrap field in double quotes
+private string Quote(string input)
+{
+    if (input == null) input = "";
+    return "\"" + input.Replace("\"", "\"\"") + "\""; // escape quotes
+}
