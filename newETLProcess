@@ -735,3 +735,66 @@
                 }
             }
         }
+
+
+
+
+private void StandardizeAndConvertData(DataTable dataTable, List<ColumnMapping> mapping)
+{
+    foreach (DataRow row in dataTable.Rows)
+    {
+        foreach (var columnMap in mapping)
+        {
+            // Get raw value from the incoming column
+            object rawValue = row[columnMap.IncomingColumnName];
+            string value = rawValue == DBNull.Value ? null : rawValue.ToString().Trim();
+
+            // Handle null or empty values
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                if (columnMap.IsRequired)
+                {
+                    // Log or flag missing required field (optional logging)
+                    Console.WriteLine($"Missing required value for column {columnMap.IncomingColumnName}");
+                }
+                row[columnMap.StandardizedColumnName] = DBNull.Value;
+                continue;
+            }
+
+            // Convert based on standardized datatype
+            switch (columnMap.DataType?.ToUpperInvariant())
+            {
+                case "DATETIME":
+                    if (DateTime.TryParse(value, out var dt))
+                        row[columnMap.StandardizedColumnName] = dt;
+                    else
+                        row[columnMap.StandardizedColumnName] = DBNull.Value;
+                    break;
+
+                case "INT":
+                    if (int.TryParse(value, out var i))
+                        row[columnMap.StandardizedColumnName] = i;
+                    else
+                        row[columnMap.StandardizedColumnName] = DBNull.Value;
+                    break;
+
+                case "DECIMAL":
+                    if (decimal.TryParse(value, out var d))
+                        row[columnMap.StandardizedColumnName] = d;
+                    else
+                        row[columnMap.StandardizedColumnName] = DBNull.Value;
+                    break;
+
+                default: // Treat as VARCHAR or any unrecognized types
+                    row[columnMap.StandardizedColumnName] = value;
+                    break;
+            }
+        }
+    }
+}
+
+
+public string IncomingColumnName { get; set; }
+public string StandardizedColumnName { get; set; }
+public string DataType { get; set; } // "INT", "DATETIME", "DECIMAL", etc.
+public bool IsRequired { get; set; }
