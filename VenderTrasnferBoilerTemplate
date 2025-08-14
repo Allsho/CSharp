@@ -1,0 +1,265 @@
+ public void Main()
+ {
+     try
+     {
+         // Load variables
+         var config = LoadVariables();
+
+         // Sequence 1: Check for files
+         if (config.Sequence == 1)
+         {
+             var matchingFiles = GetFilesByPatternAndDate(config.SourceFolder, config.FilePattern, DateTime.Now);
+
+             if (!matchingFiles.Any())
+             {
+                 Console.WriteLine($"No files found in SourceFolder '{config.SourceFolder}' for pattern '{config.FilePattern}'. Skipping payer step.");
+                 LogOperation(config, "No Files Found", "Success", $"Skipped - No files found for {config.PayerName}.");
+                 Dts.TaskResult = (int)ScriptResults.Success;
+                 return;
+             }
+
+             config.HasFiles = true;
+             Dts.Variables["User::HasFiles"].Value = true;
+             Dts.Variables["User::CurrentPayer"].Value = config.PayerName;
+         }
+         else if (config.PayerName != config.CurrentPayer || !config.HasFiles)
+         {
+             LogOperation(config, "No Files Found", "Success", "Skipped - Seq1 had no files.");
+             Dts.TaskResult = (int)ScriptResults.Success;
+             return;
+         }
+
+         // Perform the action
+         switch (config.ActionType)
+         {
+             case "Move":
+                 ProcessFiles(config, true);
+                 break;
+             case "Copy":
+                 ProcessFiles(config, false);
+                 break;
+             case "Zip":
+                 ZipFiles(config);
+                 break;
+             default:
+                 throw new Exception($"Unknown ActionType: {config.ActionType}");
+         }
+
+         Dts.TaskResult = (int)ScriptResults.Success;
+     }
+     catch (Exception ex)
+     {
+         Console.WriteLine($"Error in Main(): {ex.Message}");
+         LogOperation(null, "Error in Main()", "Failure", ex.Message);
+         Dts.TaskResult = (int)ScriptResults.Failure;
+     }
+ }
+
+ // ============================= HELPERS =============================
+
+ private (string[] Files, string[] Exclusions) GetMatchingFiles(string folder, string pattern, string exclusionList)
+ {
+     string[] exclusions = exclusionList.Split(',', (char)StringSplitOptions.RemoveEmptyEntries);
+     var files = Directory.GetFiles(folder, pattern)
+         .Where(file => !exclusions.Any(ex => Path.GetFileName(file).IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
+         .ToArray();
+
+     return (files, exclusions);
+ }
+
+ private string[] GetFilesByPatternAndDate(string folder, string pattern, DateTime filterDate)
+ {
+     return Directory.GetFiles(folder, pattern)
+         .Where(file => File.GetLastWriteTime(file).Year == filterDate.Year &&
+                        File.GetLastWriteTime(file).Month == filterDate.Month)
+         .ToArray();
+ }
+
+ private void ProcessFiles(Config config, bool isMove)
+ {
+     try
+     {
+         ValidateDirectories(config.SourceFolder, config.DestinationFolder);
+
+         var (files, _) = GetMatchingFiles(config.SourceFolder, config.FilePattern, config.ExclusionList);
+
+         foreach (var file in files)
+         {
+             string fileName = Path.GetFileName(file);
+             string destination = Path.Combine(config.DestinationFolder, fileName);
+
+             //Skip if already processed
+             if (IsAlreadyProcessed(fileName, config.MappingID))
+             {
+                 Console.WriteLine($"Skipping already processed file: {fileName}");
+                 LogOperation(config, fileName, "AlreadyProcessed", "File already moved/copied this month.");
+                 continue;
+             }
+
+             try
+             {
+                 if (isMove)
+                     File.Move(file, destination);
+                 else
+                     File.Copy(file, destination, true);
+
+                 Console.WriteLine($"{(isMove ? "Moved" : "Copied")}: {fileName}");
+                 LogOperation(config, fileName, "Success", $"File {(isMove ? "moved" : "copied")} successfully.");
+             }
+             catch (Exception ex)
+             {
+                 LogOperation(config, fileName, "Failure", ex.Message);
+             }
+         }
+     }
+     catch (Exception ex)
+     {
+         LogOperation(config, "N/A", "Failure", $"Error in ProcessFiles: {ex.Message}");
+     }
+ }
+
+ private void ZipFiles(Config config)
+ {
+     try
+     {
+         ValidateDirectories(config.SourceFolder, config.DestinationFolder);
+
+         var (files, exclusions) = GetMatchingFiles(config.SourceFolder, config.FilePattern, config.ExclusionList);
+
+         string zipPath = Path.Combine(config.DestinationFolder, $"{config.ZipName}_{DateTime.Now:yyyyMM}.zip");
+
+         using (var archive = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+         {
+             foreach (var file in files)
+             {
+                 string fileName = Path.GetFileName(file);
+
+                 // Skip if already processed
+                 if (IsAlreadyProcessed(fileName, config.MappingID))
+                 {
+                     Console.WriteLine($"Skipping already processed file: {fileName}");
+                     LogOperation(config, fileName, "AlreadyProcessed", "File already moved/copied this month.");
+                     continue;
+                 }
+
+                 try
+                 {
+                     archive.CreateEntryFromFile(file, fileName);
+                     LogOperation(config, fileName, "Success", "File compressed successfully.");
+                 }
+                 catch (Exception ex)
+                 {
+                     LogOperation(config, fileName, "Failure", $"Error zipping file: {ex.Message}");
+                 }
+             }
+         }
+
+         Console.WriteLine($"Zip file created: {zipPath}");
+     }
+     catch (Exception ex)
+     {
+         LogOperation(config, "N/A", "Failure", $"Error in ZipFiles: {ex.Message}");
+     }
+ }
+
+ private void ValidateDirectories(params string[] folders)
+ {
+     foreach (string folder in folders)
+     {
+         if (!Directory.Exists(folder))
+             throw new DirectoryNotFoundException($"Folder not found: {folder}");
+     }
+ }
+
+ private bool IsAlreadyProcessed(string fileName, int mappingID)
+ {
+     string connStr = Dts.Variables["User::CM_OLEDB_CS"].Value.ToString();
+     using (SqlConnection conn = new SqlConnection(connStr))
+     {
+         conn.Open();
+         string query = @"SELECT COUNT(*) FROM MoveIt.FileTransferLog 
+                  WHERE FileName = @FileName AND MappingID = @MappingID AND Status = 'Success'";
+
+         using (SqlCommand cmd = new SqlCommand(query, conn))
+         {
+             cmd.Parameters.AddWithValue("@FileName", fileName);
+             cmd.Parameters.AddWithValue("@MappingID", mappingID);
+             return (int)cmd.ExecuteScalar() > 0;
+         }
+     }
+ }
+
+ private Config LoadVariables()
+ {
+     return new Config
+     {
+         MappingID = Convert.ToInt32(Dts.Variables["User::MappingID"].Value),
+         ActionType = Dts.Variables["User::ActionType"].Value.ToString(),
+         SourceFolder = Dts.Variables["User::SourceFolder"].Value.ToString(),
+         DestinationFolder = Dts.Variables["User::DestinationFolder"].Value.ToString(),
+         FilePattern = Dts.Variables["User::FilePattern"].Value.ToString(),
+         ExclusionList = Dts.Variables["User::ExclusionList"].Value.ToString(),
+         ZipName = Dts.Variables["User::ZipName"].Value.ToString(),
+         PayerName = Dts.Variables["User::PayerName"].Value.ToString(),
+         Sequence = Convert.ToInt32(Dts.Variables["User::Sequence"].Value),
+         CurrentPayer = Dts.Variables["User::CurrentPayer"].Value.ToString(),
+         HasFiles = (bool)Dts.Variables["User::HasFiles"].Value
+     };
+ }
+
+ private void LogOperation(Config config, string fileName, string status, string message)
+ {
+     try
+     {
+         int mappingID = config?.MappingID ?? -1;
+         string actionType = config?.ActionType ?? "Unknown";
+
+         // Optional console log for dev/debug
+         Console.WriteLine($"[LOG] MappingID: {mappingID}, File: {fileName}, Status: {status}, Message: {message}");
+
+         // Call SQL Logging method
+         WriteLogToDatabase(mappingID, actionType, fileName, status, message);
+     }
+     catch (Exception ex)
+     {
+         Console.WriteLine($"Logging failed: {ex.Message}");
+     }
+ }
+
+ private void WriteLogToDatabase(int mappingID, string actionType, string fileName, string status, string message)
+ {
+     string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+     using (SqlConnection conn = new SqlConnection(connStr))
+     {
+         conn.Open();
+         string query = @"INSERT INTO MoveIt.FileTransferLog (MappingID, ActionType, FileName, Status, LogMessage, ProcessedAt)
+                  VALUES (@MappingID, @ActionType, @FileName, @Status, @Message, GETDATE())";
+
+         using (SqlCommand cmd = new SqlCommand(query, conn))
+         {
+             cmd.Parameters.AddWithValue("@MappingID", mappingID);
+             cmd.Parameters.AddWithValue("@ActionType", actionType);
+             cmd.Parameters.AddWithValue("@FileName", fileName);
+             cmd.Parameters.AddWithValue("@Status", status);
+             cmd.Parameters.AddWithValue("@Message", message);
+             cmd.ExecuteNonQuery();
+         }
+     }
+ }
+
+ // ============================= CLASS =============================
+
+ class Config
+ {
+     public int MappingID;
+     public string ActionType;
+     public string SourceFolder;
+     public string DestinationFolder;
+     public string FilePattern;
+     public string ExclusionList;
+     public string ZipName;
+     public string PayerName;
+     public int Sequence;
+     public string CurrentPayer;
+     public bool HasFiles;
+ }
