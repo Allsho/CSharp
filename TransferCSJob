@@ -1,461 +1,102 @@
-public void Main()
+private string GetFileHash(string filePath)
 {
-	// Variables passed from SSIS
-    string mappingID = Dts.Variables["User::MappingID"].Value.ToString();
-    string actionType = Dts.Variables["User::ActionType"].Value.ToString();
-    string sourceFolder = Dts.Variables["User::SourceFolder"].Value.ToString();
-    string destinationFolder = Dts.Variables["User::DestinationFolder"].Value.ToString();
-    string filePattern = Dts.Variables["User::FilePattern"].Value.ToString();
-    string exclusionList = Dts.Variables["User::ExclusionList"].Value.ToString();
-    string zipName = Dts.Variables["User::ZipName"].Value.ToString();
-    string archiveDeleteFolder = Dts.Variables["User::ArchiveDeleteFolder"].Value.ToString();
-
-    // Grouping logic
-    string payerName = Dts.Variables["User::PayerName"].Value.ToString();
-    int sequence = Convert.ToInt32(Dts.Variables["User::Sequence"].Value);
-
-    // Static vairables
-    string currentPayer = Dts.Variables["User::CurrentPayer"].Value.ToString();
-    bool hasFiles = (bool)Dts.Variables["User::HasFiles"].Value;
-
-    try
-    {
-        if (sequence == 1)
-        {
-            string[] matchingFiles = Directory.GetFiles(sourceFolder, filePattern)
-                .Where(file => File.GetLastWriteTime(file).Year == DateTime.Now.Year &&
-                              File.GetLastWriteTime(file).Month == DateTime.Now.Month)
-                .ToArray();
-            if (matchingFiles.Length == 0)
-            {
-                Console.WriteLine($"No files found in SourceFolder ' {sourceFolder}' for pattern '{filePattern}'. Skipping payer step.");
-                LogOperation("No Files Found", "Success", $"Skipped - No files found for {payerName}.");
-                Dts.TaskResult = (int)ScriptResults.Success;
-                return;
-            }
-            hasFiles = true;
-            Dts.Variables["User::HasFiles"].Value = true;
-            Dts.Variables["User::CurrentPayer"].Value = payerName;
-        }
-        else if (payerName != currentPayer || !hasFiles)
-        {
-            LogOperation("No Files Found", "Success", "Skipped - Seq1 had no files.");
-            Dts.TaskResult = (int)ScriptResults.Success;
-            return;
-        }
-
-        // Perform action based on ActionType
-        switch (actionType)
-        {
-            case "Move":
-                MoveFiles(sourceFolder, destinationFolder, filePattern, exclusionList, archiveDeleteFolder);
-                break;
-
-            case "Copy":
-                CopyFiles(sourceFolder, destinationFolder, filePattern, exclusionList, archiveDeleteFolder);
-                break;
-
-            case "Zip":
-                ZipFiles(sourceFolder, destinationFolder, filePattern, exclusionList, zipName, archiveDeleteFolder);
-                break;
-
-            default:
-                throw new Exception("Unknown ActionType: " + actionType);
-        }
-
-        Dts.TaskResult = (int)ScriptResults.Success;
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error in Main(): {ex.Message}");
-        LogOperation("Error in Main()", "Failure", ex.Message);
-        Dts.TaskResult = (int)ScriptResults.Failure;
-    }
-}
-
-// Move Files with Exclusion logic
-private void MoveFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, string archiveDeleteFolder)
-{
-    ProcessFiles(sourceFolder, destinationFolder, filePattern, exclusionList, true, archiveDeleteFolder);
-}
-
-// Copy Files with Exclusion Logic
-private void CopyFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, string archiveDeleteFolder)
-{
-    ProcessFiles(sourceFolder, destinationFolder, filePattern, exclusionList, false, archiveDeleteFolder);
-}
-
-// Zip Files and Move to Outbound
-private void ZipFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, string zipName, string archiveDeleteFolder)
-{
-    try
-    {
-        if (!Directory.Exists(sourceFolder))
-            throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
-
-        if (!Directory.Exists(destinationFolder))
-            throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
-            //Directory.CreateDirectory(destinationFolder);
-
-        // Convert exclusion list into an array
-        string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-
-        // Get all files from source folder
-        string[] files = Directory.GetFiles(sourceFolder, filePattern);
-
-        // Generate zip file name based on timestamp
-        string zipFileName = Path.Combine(destinationFolder, $"{zipName}_{DateTime.Now:yyyyMM}.zip");
-
-        // Create and write to zip file
-        using (ZipArchive archive = ZipFile.Open(zipFileName, ZipArchiveMode.Create))
-        {
-            foreach (string file in files)
-            {
-                string fileName = Path.GetFileName(file);
-
-                // Ensure the file is directly inside the source folder
-                if (!file.StartsWith(sourceFolder, StringComparison.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine($"Skipped file outside source folder: {fileName}");
-                    continue;
-                }
-
-                // Check Exclusion List using Contains
-                if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
-                {
-                    Console.WriteLine($"Exlcuded file: {fileName}");
-                    continue;
-                }
-
-                try
-                {
-                    string hash = ComputeFileHash(file);
-                    if (IsFileAlreadyProcessed(hash))
-                    {
-                        string deletePath = Path.Combine(archiveDeleteFolder, fileName);
-                        File.Move(file, deletePath);
-                        Console.WriteLine($"Skipped duplicate (zip): {fileName}. Moved to DeleteAfter7Days.");
-                        LogOperation(fileName, "Skipped", "Duplicate file (hash match).");
-                        continue;
-                    }
-
-                    FileInfo info = new FileInfo(file);
-                    SaveFileHashToDb(fileName, hash, info.Length);
-
-                    archive.CreateEntryFromFile(file, fileName);
-                    Console.WriteLine($"Zipped: {fileName}");
-                    LogOperation(fileName, "Success", "File compressed successfully.");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error zipping file: {fileName}. Error: {ex.Message}");
-                    LogOperation(fileName, "Failure", ex.Message);
-                }
-            }
-        }
-
-        Console.WriteLine($"Zip file created: {zipFileName}");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error in ZipFiles(): {ex.Message}");
-        LogOperation("N/A", "Failure", ex.Message);
-    }
-}
-
-// Core File Processing Function
-private void ProcessFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, bool isMove, string archiveDeleteFolder)
-{
-    try
-    {
-        if (!Directory.Exists(sourceFolder))
-            throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
-
-        if (!Directory.Exists(destinationFolder))
-            throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
-            //Directory.CreateDirectory(destinationFolder);
-
-        // Convert exclusion list into an array
-        string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-
-        // Get matching files
-        string[] files = Directory.GetFiles(sourceFolder, filePattern);
-
-        foreach (string file in files)
-        {
-            string fileName = Path.GetFileName(file);
-
-            string hash = ComputeFileHash(file);
-            if (IsFileAlreadyProcessed(hash))
-            {
-                // Move duplicate to DeleteAfter7Days folder
-                string deletePath = Path.Combine(archiveDeleteFolder, fileName);
-                File.Move(file, deletePath);
-                Console.WriteLine($"Skipped duplicate file: {fileName}. Moved to DeleteAfter7Days.");
-                LogOperation(fileName, "Skipped", "Duplicate file (hash match). Moved to delete folder.");
-                continue;
-            }
-
-            // Save hash to DB before proceeding
-            FileInfo info = new FileInfo(file);
-            SaveFileHashToDb(fileName, hash, info.Length);
-
-            // Check Exclusion List
-            if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
-            {
-                Console.WriteLine($"Excluded file: {fileName}");
-                LogOperation(fileName, "Excluded", "File excluded based on exclusion list.");
-                continue;
-            }
-
-            string destinationFile = Path.Combine(destinationFolder, fileName);
-
-            try
-            {
-                if (isMove)
-                {
-                    File.Move(file, destinationFile);
-                    Console.WriteLine($"Moved: {fileName}");
-                    LogOperation(fileName, "Success", "File moved successfully.");
-                }
-                else
-                {
-                    File.Copy(file, destinationFile, true);
-                    Console.WriteLine($"Copied: {fileName}");
-                    LogOperation(fileName, "Success", "File moved successfully.");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error processing file: {fileName}. Error: {ex.Message}");
-                LogOperation(fileName, "Failure", ex.Message);
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error in ProcessFiles(): {ex.Message}");
-        LogOperation("N.A", "Failure", ex.Message);
-    }
-}
-
-private string ComputeFileHash(string filePath)
-{
-    using (var sha = SHA256.Create())
+    using (var sha256 = System.Security.Cryptography.SHA256.Create())
     using (var stream = File.OpenRead(filePath))
     {
-        byte[] hashBytes = sha.ComputeHash(stream);
-        return BitConverter.ToString(hashBytes).Replace("-", "").ToLowerInvariant();
+        var hash = sha256.ComputeHash(stream);
+        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
     }
 }
 
-private bool IsFileAlreadyProcessed(string hash)
-{
-    string connString = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
 
-    using (SqlConnection conn = new SqlConnection(connString))
+
+foreach (var file in files)
+{
+    string fileName = Path.GetFileName(file);
+    string destination = Path.Combine(config.DestinationFolder, fileName);
+    long fileSize = new FileInfo(file).Length;
+    string fileHash = GetFileHash(file);
+
+    // Skip if already processed (check by name + size + hash)
+    if (IsAlreadyProcessed(fileName, config.MappingID, fileSize, fileHash))
+    {
+        Console.WriteLine($"Skipping duplicate file: {fileName}");
+        LogOperation(config, fileName, "Duplicate", $"Duplicate file detected. Size={fileSize}, Hash={fileHash}", fileSize, fileHash);
+        continue;
+    }
+
+    try
+    {
+        if (isMove) File.Move(file, destination);
+        else File.Copy(file, destination, true);
+
+        Console.WriteLine($"{(isMove ? "Moved" : "Copied")}: {fileName}");
+        LogOperation(config, fileName, "Success", $"File {(isMove ? "moved" : "copied")} successfully.", fileSize, fileHash);
+    }
+    catch (Exception ex)
+    {
+        LogOperation(config, fileName, "Failure", ex.Message, fileSize, fileHash);
+    }
+}
+
+private bool IsAlreadyProcessed(string fileName, int mappingID, long fileSize, string fileHash)
+{
+    string connStr = Dts.Variables["User::CM_OLEDB_CS"].Value.ToString();
+    using (SqlConnection conn = new SqlConnection(connStr))
     {
         conn.Open();
-        using (SqlCommand cmd = new SqlCommand("SELECT COUNT(*) FROM MoveIt.FileTransferHistory WHERE FileHash = @hash", conn))
+        string query = @"SELECT COUNT(*) FROM MoveIt.FileTransferLog 
+                         WHERE FileName = @FileName 
+                           AND MappingID = @MappingID 
+                           AND FileSize = @FileSize
+                           AND FileHash = @FileHash
+                           AND Status = 'Success'";
+        using (SqlCommand cmd = new SqlCommand(query, conn))
         {
-            cmd.Parameters.AddWithValue("@hash", hash);
-            int count = (int)cmd.ExecuteScalar();
-            return count > 0;
+            cmd.Parameters.AddWithValue("@FileName", fileName);
+            cmd.Parameters.AddWithValue("@MappingID", mappingID);
+            cmd.Parameters.AddWithValue("@FileSize", fileSize);
+            cmd.Parameters.AddWithValue("@FileHash", fileHash);
+            return (int)cmd.ExecuteScalar() > 0;
         }
     }
 }
 
-private void SaveFileHashToDb(string fileName, string fileHash, long fileSize)
+private void LogOperation(Config config, string fileName, string status, string message, long fileSize = 0, string fileHash = null)
 {
-    string connString = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+    try
+    {
+        int mappingID = config?.MappingID ?? -1;
+        string actionType = config?.ActionType ?? "Unknown";
+        Console.WriteLine($"[LOG] MappingID: {mappingID}, File: {fileName}, Size: {fileSize}, Hash: {fileHash}, Status: {status}, Message: {message}");
+        WriteLogToDatabase(mappingID, actionType, fileName, status, message, fileSize, fileHash);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Logging failed: {ex.Message}");
+    }
+}
 
-    using (SqlConnection conn = new SqlConnection(connString))
+private void WriteLogToDatabase(int mappingID, string actionType, string fileName, string status, string message, long fileSize, string fileHash)
+{
+    string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+    using (SqlConnection conn = new SqlConnection(connStr))
     {
         conn.Open();
-        using (SqlCommand cmd = new SqlCommand(@"
-            INSERT INTO MoveIt.FileTransferHistory (FileName, FileHash, FileSize, ProcessedDate, LastSeenDate)
-            VALUES (@fileName, @fileHash, @fileSize, GETDATE(), GETDATE())", conn))
+        string query = @"INSERT INTO MoveIt.FileTransferLog 
+                        (MappingID, ActionType, FileName, FileSize, FileHash, Status, LogMessage, ProcessedAt)
+                        VALUES (@MappingID, @ActionType, @FileName, @FileSize, @FileHash, @Status, @Message, GETDATE())";
+        using (SqlCommand cmd = new SqlCommand(query, conn))
         {
-            cmd.Parameters.AddWithValue("@fileName", fileName);
-            cmd.Parameters.AddWithValue("@fileHash", fileHash);
-            cmd.Parameters.AddWithValue("@fileSize", fileSize);
+            cmd.Parameters.AddWithValue("@MappingID", mappingID);
+            cmd.Parameters.AddWithValue("@ActionType", actionType);
+            cmd.Parameters.AddWithValue("@FileName", fileName);
+            cmd.Parameters.AddWithValue("@FileSize", fileSize);
+            cmd.Parameters.AddWithValue("@FileHash", (object)fileHash ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@Status", status);
+            cmd.Parameters.AddWithValue("@Message", message);
             cmd.ExecuteNonQuery();
         }
-    }
-}
-
-private void LogOperation(string fileName, string status, string logMessage)
-{
-    try
-    {
-        string connString = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-
-        using (SqlConnection conn = new SqlConnection(connString))
-        {
-            conn.Open();
-            using (SqlCommand cmd = new SqlCommand(@"
-                INSERT INTO MoveIt.FileTransferLog (MappingID, ActionType, FileName, Status, LogMessage, ProcessedAt)
-                VALUES (@mappingID, @actionType, @fileName, @status, @logMessage, GETDATE())", conn))
-            {
-                cmd.Parameters.AddWithValue("@mappingID", Convert.ToInt32(Dts.Variables["User::MappingID"].Value));
-                cmd.Parameters.AddWithValue("@actionType", Dts.Variables["User::ActionType"].Value.ToString());
-                cmd.Parameters.AddWithValue("@fileName", fileName);
-                cmd.Parameters.AddWithValue("@status", status);
-                cmd.Parameters.AddWithValue("@logMessage", logMessage);
-                cmd.ExecuteNonQuery();
-            }
-        }
-
-        Console.WriteLine($"Log saved to DB - File: {fileName}, Status: {status}");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error while logging to DB: {ex.Message}");
-    }
-}
-
-private void ProcessFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, bool isMove, string archiveDeleteFolder)
-{
-    try
-    {
-        if (!Directory.Exists(sourceFolder))
-            throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
-
-        if (!Directory.Exists(destinationFolder))
-            throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
-
-        string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-        string[] files = Directory.GetFiles(sourceFolder, filePattern);
-
-        foreach (string file in files)
-        {
-            string fileName = Path.GetFileName(file);
-
-            // 1. Check exclusion first
-            if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
-            {
-                Console.WriteLine($"Excluded file: {fileName}");
-                LogOperation(fileName, "Excluded", "File excluded based on exclusion list.");
-                continue;
-            }
-
-            // 2. Compute hash AFTER exclusion check
-            string hash = ComputeFileHash(file);
-            if (IsFileAlreadyProcessed(hash))
-            {
-                string deletePath = Path.Combine(archiveDeleteFolder, fileName);
-                File.Move(file, deletePath);
-                Console.WriteLine($"Skipped duplicate file: {fileName}. Moved to DeleteAfter7Days.");
-                LogOperation(fileName, "Skipped", "Duplicate file (hash match). Moved to delete folder.");
-                continue;
-            }
-
-            // 3. Save to DB now that it passed checks
-            FileInfo info = new FileInfo(file);
-            SaveFileHashToDb(fileName, hash, info.Length);
-
-            string destinationFile = Path.Combine(destinationFolder, fileName);
-            try
-            {
-                if (isMove)
-                {
-                    File.Move(file, destinationFile);
-                    Console.WriteLine($"Moved: {fileName}");
-                    LogOperation(fileName, "Success", "File moved successfully.");
-                }
-                else
-                {
-                    File.Copy(file, destinationFile, true);
-                    Console.WriteLine($"Copied: {fileName}");
-                    LogOperation(fileName, "Success", "File copied successfully.");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error processing file: {fileName}. Error: {ex.Message}");
-                LogOperation(fileName, "Failure", ex.Message);
-            }
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error in ProcessFiles(): {ex.Message}");
-        LogOperation("N.A", "Failure", ex.Message);
-    }
-}
-
-
-
-
-private void ZipFiles(string sourceFolder, string destinationFolder, string filePattern, string exclusionList, string zipName, string archiveDeleteFolder)
-{
-    try
-    {
-        if (!Directory.Exists(sourceFolder))
-            throw new DirectoryNotFoundException($"Source folder not found: {sourceFolder}");
-
-        if (!Directory.Exists(destinationFolder))
-            throw new DirectoryNotFoundException($"Destination folder not found: {destinationFolder}");
-
-        // Convert exclusion list into array
-        string[] exclusions = exclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-
-        // Get files matching pattern
-        string[] files = Directory.GetFiles(sourceFolder, filePattern);
-
-        // Create zip file with timestamped name
-        string zipFileName = Path.Combine(destinationFolder, $"{zipName}_{DateTime.Now:yyyyMM}.zip");
-
-        using (ZipArchive archive = ZipFile.Open(zipFileName, ZipArchiveMode.Create))
-        {
-            foreach (string file in files)
-            {
-                string fileName = Path.GetFileName(file);
-
-                // 1. Exclusion check
-                if (Array.Exists(exclusions, ex => fileName.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0))
-                {
-                    Console.WriteLine($"Excluded file: {fileName}");
-                    LogOperation(fileName, "Excluded", "File excluded based on exclusion list.");
-                    continue;
-                }
-
-                // 2. Compute hash
-                string hash = ComputeFileHash(file);
-                if (IsFileAlreadyProcessed(hash))
-                {
-                    string deletePath = Path.Combine(archiveDeleteFolder, fileName);
-                    File.Move(file, deletePath);
-                    Console.WriteLine($"Skipped duplicate (zip): {fileName}. Moved to DeleteAfter7Days.");
-                    LogOperation(fileName, "Skipped", "Duplicate file (hash match). Moved to delete folder.");
-                    continue;
-                }
-
-                // 3. Save hash to DB
-                FileInfo info = new FileInfo(file);
-                SaveFileHashToDb(fileName, hash, info.Length);
-
-                // 4. Add to zip
-                try
-                {
-                    archive.CreateEntryFromFile(file, fileName);
-                    Console.WriteLine($"Zipped: {fileName}");
-                    LogOperation(fileName, "Success", "File compressed and zipped.");
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Error zipping file: {fileName}. Error: {ex.Message}");
-                    LogOperation(fileName, "Failure", ex.Message);
-                }
-            }
-        }
-
-        Console.WriteLine($"Zip file created: {zipFileName}");
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error in ZipFiles(): {ex.Message}");
-        LogOperation("N/A", "Failure", ex.Message);
     }
 }
 
