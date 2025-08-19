@@ -1,3 +1,25 @@
+public void Main()
+{
+    try
+    {
+        var config = Config.LoadFromVariables(Dts.Variables);
+
+        // Pass Dts.Variables into FileProcessor
+        var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables);
+        processor.Execute();
+
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error in Main(): {ex.Message}");
+        new Logger(Dts.Variables).LogError("Main", ex.Message);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+    }
+}
+
+
+
 public class FileProcessor
 {
     private readonly Config _config;
@@ -14,37 +36,28 @@ public class FileProcessor
     public void Execute()
     {
         bool anyNewProcessed = false;
-        var filesInFolder = GetMatchingFiles();
-        bool hasFiles = filesInFolder.Length > 0;
+        bool allDuplicates = true;
 
         switch (_config.ActionType)
         {
             case "Move":
-                anyNewProcessed = ProcessFiles(isMove: true);
+                anyNewProcessed = ProcessFiles(isMove: true, ref allDuplicates);
                 break;
             case "Copy":
-                anyNewProcessed = ProcessFiles(isMove: false);
+                anyNewProcessed = ProcessFiles(isMove: false, ref allDuplicates);
                 break;
             case "Zip":
-                anyNewProcessed = ZipFiles();
+                anyNewProcessed = ZipFiles(ref allDuplicates);
                 break;
             default:
                 throw new Exception($"Unknown ActionType: {_config.ActionType}");
         }
 
-        // Only log once if there were files but none were new
-        if (_config.Sequence == 1 && hasFiles && !anyNewProcessed)
+        // Summary if all files were duplicates
+        if (_config.Sequence == 1 && allDuplicates)
         {
-            try
-            {
-                _vars["User::HasFiles"].Value = false;
-                _logger.LogInfo(_config, "AllDuplicates",
-                    "All files were duplicates and moved to archive; skipping further actions.");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError("SetHasFilesFalse", ex.Message);
-            }
+            _logger.LogInfo(_config, "AllDuplicates", "All files were duplicates and moved to archive or skipped.");
+            _vars["User::HasFiles"].Value = false;
         }
     }
 
@@ -56,7 +69,7 @@ public class FileProcessor
             .ToArray();
     }
 
-    private bool ProcessFiles(bool isMove)
+    private bool ProcessFiles(bool isMove, ref bool allDuplicates)
     {
         bool processedAnyNew = false;
 
@@ -72,12 +85,10 @@ public class FileProcessor
                 var fileName = Path.GetFileName(file);
                 long fileSize = new FileInfo(file).Length;
 
-                // Duplicate → move to ArchiveFolder and log once
                 if (IsAlreadyProcessed(fileName, _config.MappingID, fileSize))
                 {
                     MoveToArchiveSafely(file, fileName);
-                    _logger.LogInfo(_config, fileName,
-                        $"File {fileName} with size {fileSize} already processed. Skipping further actions.");
+                    _logger.LogInfo(_config, fileName, $"Duplicate file {fileName} with size {fileSize} moved to archive.");
                     continue;
                 }
 
@@ -95,23 +106,26 @@ public class FileProcessor
                     }
 
                     processedAnyNew = true;
+                    allDuplicates = false;
                     _logger.LogSuccess(_config, fileName, isMove ? "Moved" : "Copied", fileSize);
                 }
                 catch (Exception ex)
                 {
                     _logger.LogError(fileName, ex.Message, fileSize);
+                    allDuplicates = false; // treat errors as not duplicates
                 }
             }
         }
         catch (Exception ex)
         {
             _logger.LogError("ProcessFiles", ex.Message);
+            allDuplicates = false;
         }
 
         return processedAnyNew;
     }
 
-    private bool ZipFiles()
+    private bool ZipFiles(ref bool allDuplicates)
     {
         bool zippedAnything = false;
 
@@ -122,27 +136,20 @@ public class FileProcessor
 
             var files = GetMatchingFiles();
 
-            var toZip = files.Where(f =>
-            {
-                var fi = new FileInfo(f);
-                return !IsAlreadyProcessed(fi.Name, _config.MappingID, fi.Length);
-            }).ToArray();
-
+            var toZip = files.Where(f => !IsAlreadyProcessed(Path.GetFileName(f), _config.MappingID, new FileInfo(f).Length)).ToArray();
             var duplicates = files.Except(toZip).ToArray();
 
-            // Archive duplicates and log once
+            // Archive duplicates
             foreach (var dup in duplicates)
             {
-                long fileSize = new FileInfo(dup).Length;
                 MoveToArchiveSafely(dup, Path.GetFileName(dup));
-                _logger.LogInfo(_config, Path.GetFileName(dup),
-                    $"File {Path.GetFileName(dup)} with size {fileSize} already processed. Moved to archive.");
+                _logger.LogInfo(_config, Path.GetFileName(dup), $"Duplicate file moved to archive.");
             }
 
             if (toZip.Length == 0)
             {
-                _logger.LogInfo(_config, "Zip", "No new files to zip (all duplicates archived).");
-                return false; // don’t create/append empty zip
+                allDuplicates = true;
+                return false; // no new files to zip
             }
 
             var zipPath = Path.Combine(_config.DestinationFolder, $"{_config.ZipName}_{DateTime.Now:yyyyMM}.zip");
@@ -153,25 +160,17 @@ public class FileProcessor
                 foreach (var file in toZip)
                 {
                     var fileName = Path.GetFileName(file);
-                    try
-                    {
-                        bool entryExists = archive.Entries.Any(e =>
-                            string.Equals(e.Name, fileName, StringComparison.OrdinalIgnoreCase));
 
-                        if (!entryExists)
-                        {
-                            archive.CreateEntryFromFile(file, fileName);
-                            zippedAnything = true;
-                            _logger.LogSuccess(_config, fileName, "Appended to Zip", new FileInfo(file).Length);
-                        }
-                        else
-                        {
-                            _logger.LogInfo(_config, fileName, "Skipped (already in zip).");
-                        }
-                    }
-                    catch (Exception ex)
+                    if (!archive.Entries.Any(e => string.Equals(e.Name, fileName, StringComparison.OrdinalIgnoreCase)))
                     {
-                        _logger.LogError($"Zip:{fileName}", ex.Message, new FileInfo(file).Length);
+                        archive.CreateEntryFromFile(file, fileName);
+                        zippedAnything = true;
+                        allDuplicates = false;
+                        _logger.LogSuccess(_config, fileName, "Appended to Zip", new FileInfo(file).Length);
+                    }
+                    else
+                    {
+                        _logger.LogInfo(_config, fileName, "Skipped (already in zip).");
                     }
                 }
             }
@@ -179,6 +178,7 @@ public class FileProcessor
         catch (Exception ex)
         {
             _logger.LogError("ZipFiles", ex.Message);
+            allDuplicates = false;
         }
 
         return zippedAnything;
@@ -203,8 +203,6 @@ public class FileProcessor
                 if (File.Exists(dest)) File.Delete(dest);
                 File.Move(sourcePath, dest);
             }
-
-            _logger.LogInfo(_config, fileName, $"Duplicate detected; moved to archive '{_config.ArchiveFolder}'.");
         }
         catch (Exception ex)
         {
@@ -263,51 +261,3 @@ public class FileProcessor
         }
     }
 }
-
- public void Main()
- {
-     try
-     {
-         var config = Config.LoadFromVariables(Dts.Variables);
-
-         if (!ShouldProcess(config))
-         {
-             Dts.TaskResult = (int)ScriptResults.Success;
-             return;
-         }
-
-         // CHANGE: pass Dts.Variables into FileProcessor
-         var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables);
-         processor.Execute();
-
-         Dts.TaskResult = (int)ScriptResults.Success;
-     }
-     catch (Exception ex)
-     {
-         Console.WriteLine($"Error in Main(): {ex.Message}");
-         new Logger(Dts.Variables).LogError("Main", ex.Message);
-         Dts.TaskResult = (int)ScriptResults.Failure;
-     }
- }
-
- private bool ShouldProcess(Config config)
- {
-     if (config.Sequence == 1)
-     {
-         var files = FileProcessor.GetFilesByPatternAndDate(config.SourceFolder, config.FilePattern, DateTime.Now);
-         if (!files.Any())
-         {
-             new Logger(Dts.Variables).LogInfo(config, "No Files Found", $"Skipped - No files found for {config.PayerName}.");
-             return false;
-         }
-         config.HasFiles = true;
-         Dts.Variables["User::HasFiles"].Value = true;
-         Dts.Variables["User::CurrentPayer"].Value = config.PayerName;
-     }
-     else if (config.PayerName != config.CurrentPayer || !config.HasFiles)
-     {
-         new Logger(Dts.Variables).LogInfo(config, "No Files Found", "Skipped - Seq1 had no files.");
-         return false;
-     }
-     return true;
- }
