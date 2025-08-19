@@ -1,102 +1,326 @@
-private string GetFileHash(string filePath)
+#FileProcessor.cs
+
+public class FileProcessor
 {
-    using (var sha256 = System.Security.Cryptography.SHA256.Create())
-    using (var stream = File.OpenRead(filePath))
+    private readonly Config _config;
+    private readonly Logger _logger;
+    private readonly Variables _vars;
+
+    public FileProcessor(Config config, Logger logger, Variables vars)
     {
-        var hash = sha256.ComputeHash(stream);
-        return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
-    }
-}
-
-
-
-foreach (var file in files)
-{
-    string fileName = Path.GetFileName(file);
-    string destination = Path.Combine(config.DestinationFolder, fileName);
-    long fileSize = new FileInfo(file).Length;
-    string fileHash = GetFileHash(file);
-
-    // Skip if already processed (check by name + size + hash)
-    if (IsAlreadyProcessed(fileName, config.MappingID, fileSize, fileHash))
-    {
-        Console.WriteLine($"Skipping duplicate file: {fileName}");
-        LogOperation(config, fileName, "Duplicate", $"Duplicate file detected. Size={fileSize}, Hash={fileHash}", fileSize, fileHash);
-        continue;
+        _config = config;
+        _logger = logger;
+        _vars = vars;
     }
 
-    try
+    public void Execute()
     {
-        if (isMove) File.Move(file, destination);
-        else File.Copy(file, destination, true);
+        bool anyNewProcessed = false;
 
-        Console.WriteLine($"{(isMove ? "Moved" : "Copied")}: {fileName}");
-        LogOperation(config, fileName, "Success", $"File {(isMove ? "moved" : "copied")} successfully.", fileSize, fileHash);
-    }
-    catch (Exception ex)
-    {
-        LogOperation(config, fileName, "Failure", ex.Message, fileSize, fileHash);
-    }
-}
-
-private bool IsAlreadyProcessed(string fileName, int mappingID, long fileSize, string fileHash)
-{
-    string connStr = Dts.Variables["User::CM_OLEDB_CS"].Value.ToString();
-    using (SqlConnection conn = new SqlConnection(connStr))
-    {
-        conn.Open();
-        string query = @"SELECT COUNT(*) FROM MoveIt.FileTransferLog 
-                         WHERE FileName = @FileName 
-                           AND MappingID = @MappingID 
-                           AND FileSize = @FileSize
-                           AND FileHash = @FileHash
-                           AND Status = 'Success'";
-        using (SqlCommand cmd = new SqlCommand(query, conn))
+        switch (_config.ActionType)
         {
-            cmd.Parameters.AddWithValue("@FileName", fileName);
-            cmd.Parameters.AddWithValue("@MappingID", mappingID);
-            cmd.Parameters.AddWithValue("@FileSize", fileSize);
-            cmd.Parameters.AddWithValue("@FileHash", fileHash);
-            return (int)cmd.ExecuteScalar() > 0;
+            case "Move":
+                anyNewProcessed = ProcessFiles(isMove: true);
+                break;
+            case "Copy":
+                anyNewProcessed = ProcessFiles(isMove: false);
+                break;
+            case "Zip":
+                anyNewProcessed = ZipFiles();
+                break;
+            default:
+                throw new Exception($"Unknown ActionType: {_config.ActionType}");
+        }
+
+        // If this is Sequence 1 and nothing new was processed (all duplicates → archived),
+        // ensure later sequences skip.
+        if (_config.Sequence == 1 && !anyNewProcessed)
+        {
+            try
+            {
+                _vars["User::HasFiles"].Value = false;
+                _logger.LogInfo(_config, "AllDuplicates", "All files were previously processed; archived and skipping later sequences.");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError("SetHasFilesFalse", ex.Message);
+            }
+        }
+    }
+
+    public static string[] GetFilesByPatternAndDate(string folder, string pattern, DateTime date)
+    {
+        return Directory.GetFiles(folder, pattern)
+            .Where(file => File.GetLastWriteTime(file).Year == date.Year &&
+                           File.GetLastWriteTime(file).Month == date.Month)
+            .ToArray();
+    }
+
+    private bool ProcessFiles(bool isMove)
+    {
+        bool processedAnyNew = false;
+
+        try
+        {
+            ValidateDirectories(_config.SourceFolder, _config.DestinationFolder);
+            EnsureDirectory(_config.ArchiveFolder);
+
+            var files = GetMatchingFiles();
+
+            foreach (var file in files)
+            {
+                var fileName = Path.GetFileName(file);
+
+                // Duplicate → move to ArchiveFolder and skip normal action
+                if (IsAlreadyProcessed(fileName))
+                {
+                    MoveToArchiveSafely(file, fileName);
+                    continue;
+                }
+
+                try
+                {
+                    var dest = Path.Combine(_config.DestinationFolder, fileName);
+                    if (isMove)
+                    {
+                        if (File.Exists(dest)) File.Delete(dest);
+                        File.Move(file, dest);
+                    }
+                    else
+                    {
+                        File.Copy(file, dest, true);
+                    }
+
+                    processedAnyNew = true;
+                    _logger.LogSuccess(_config, fileName, isMove ? "Moved" : "Copied");
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(fileName, ex.Message);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError("ProcessFiles", ex.Message);
+        }
+
+        return processedAnyNew;
+    }
+
+    private bool ZipFiles()
+    {
+        bool zippedAnything = false;
+
+        try
+        {
+            ValidateDirectories(_config.SourceFolder, _config.DestinationFolder);
+            EnsureDirectory(_config.ArchiveFolder);
+
+            var files = GetMatchingFiles();
+
+            // Split: non-duplicates to zip, duplicates to archive
+            var toZip = files.Where(f => !IsAlreadyProcessed(Path.GetFileName(f))).ToArray();
+            var duplicates = files.Except(toZip).ToArray();
+
+            // Archive duplicates (so reposts get taken out of the pipe)
+            foreach (var dup in duplicates)
+            {
+                MoveToArchiveSafely(dup, Path.GetFileName(dup));
+            }
+
+            if (toZip.Length == 0)
+            {
+                _logger.LogInfo(_config, "Zip", "No new files to zip (all duplicates archived).");
+                return false; // do NOT create an empty zip
+            }
+
+            var zipPath = Path.Combine(_config.DestinationFolder, $"{_config.ZipName}_{DateTime.Now:yyyyMM}.zip");
+            var mode = File.Exists(zipPath) ? ZipArchiveMode.Update : ZipArchiveMode.Create;
+
+            using (var archive = ZipFile.Open(zipPath, mode))
+            {
+                foreach (var file in toZip)
+                {
+                    var fileName = Path.GetFileName(file);
+                    try
+                    {
+                        // avoid duplicates inside the zip
+                        bool entryExists = archive.Entries.Any(e => string.Equals(e.Name, fileName, StringComparison.OrdinalIgnoreCase));
+                        if (!entryExists)
+                        {
+                            archive.CreateEntryFromFile(file, fileName);
+                            zippedAnything = true;
+                            _logger.LogSuccess(_config, fileName, "Compressed");
+                        }
+                        else
+                        {
+                            _logger.LogInfo(_config, fileName, "Skipped (already in zip).");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError($"Zip:{fileName}", ex.Message);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError("ZipFiles", ex.Message);
+        }
+
+        return zippedAnything;
+    }
+
+    private void MoveToArchiveSafely(string sourcePath, string fileName)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(_config.ArchiveFolder))
+            {
+                _logger.LogError("ArchiveFolder", "ArchiveFolder is empty; cannot move duplicate to archive.");
+                return;
+            }
+
+            EnsureDirectory(_config.ArchiveFolder);
+
+            var dest = Path.Combine(_config.ArchiveFolder, fileName);
+
+            if (File.Exists(sourcePath))
+            {
+                if (File.Exists(dest)) File.Delete(dest);
+                File.Move(sourcePath, dest);
+            }
+
+            _logger.LogInfo(_config, fileName, $"Duplicate detected; moved to archive '{_config.ArchiveFolder}'.");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError($"Archive:{fileName}", ex.Message);
+        }
+    }
+
+    private string[] GetMatchingFiles()
+    {
+        // C# 7.3-safe split + case-insensitive match using IndexOf
+        var exclusions = _config.ExclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+        return Directory.GetFiles(_config.SourceFolder, _config.FilePattern)
+            .Where(file =>
+            {
+                var name = Path.GetFileName(file);
+                return !exclusions.Any(ex => name.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0);
+            })
+            .ToArray();
+    }
+
+    private bool IsAlreadyProcessed(string fileName, int mappingID, long fileSize, string fileHash)
+    {
+        var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+
+        using (var conn = new SqlConnection(connStr))
+        {
+            conn.Open();
+            string query = @"SELECT COUNT(*) FROM MoveIt.FileTransferLog 
+                     WHERE FileName = @FileName 
+                       AND MappingID = @MappingID 
+                       AND FileSize = @FileSize
+                       AND FileHash = @FileHash
+                       AND Status = 'Success'";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@FileName", fileName);
+                cmd.Parameters.AddWithValue("@MappingID", mappingID);
+                cmd.Parameters.AddWithValue("@FileSize", fileSize);
+                cmd.Parameters.AddWithValue("@FileHash", fileHash);
+                return (int)cmd.ExecuteScalar() > 0;
+            }
+        }
+    }
+
+    private void ValidateDirectories(params string[] folders)
+    {
+        foreach (var folder in folders)
+        {
+            if (!Directory.Exists(folder))
+                throw new DirectoryNotFoundException($"Folder not found: {folder}");
+        }
+    }
+
+    private void EnsureDirectory(string folder)
+    {
+        if (!string.IsNullOrWhiteSpace(folder) && !Directory.Exists(folder))
+        {
+            Directory.CreateDirectory(folder);
+        }
+    }
+
+    private string GetFileHash(string filePath)
+    {
+        using (var sha256 = System.Security.Cryptography.SHA256.Create())
+        using (var stream = File.OpenRead(filePath))
+        {
+            var hash = sha256.ComputeHash(stream);
+            return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
         }
     }
 }
 
-private void LogOperation(Config config, string fileName, string status, string message, long fileSize = 0, string fileHash = null)
+# Logger.cs
+public class Logger
 {
-    try
-    {
-        int mappingID = config?.MappingID ?? -1;
-        string actionType = config?.ActionType ?? "Unknown";
-        Console.WriteLine($"[LOG] MappingID: {mappingID}, File: {fileName}, Size: {fileSize}, Hash: {fileHash}, Status: {status}, Message: {message}");
-        WriteLogToDatabase(mappingID, actionType, fileName, status, message, fileSize, fileHash);
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Logging failed: {ex.Message}");
-    }
-}
+    private readonly Variables _vars;
 
-private void WriteLogToDatabase(int mappingID, string actionType, string fileName, string status, string message, long fileSize, string fileHash)
-{
-    string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-    using (SqlConnection conn = new SqlConnection(connStr))
+    public Logger(Variables vars)
     {
-        conn.Open();
-        string query = @"INSERT INTO MoveIt.FileTransferLog 
-                        (MappingID, ActionType, FileName, FileSize, FileHash, Status, LogMessage, ProcessedAt)
-                        VALUES (@MappingID, @ActionType, @FileName, @FileSize, @FileHash, @Status, @Message, GETDATE())";
-        using (SqlCommand cmd = new SqlCommand(query, conn))
+        _vars = vars;
+    }
+
+    public void LogInfo(Config config, string fileName, string message) =>
+        Log(config, fileName, "Success", message);
+
+    public void LogSuccess(Config config, string fileName, string action) =>
+        Log(config, fileName, "Success", $"File {action} successfully.");
+
+    public void LogError(string context, string message) =>
+        Log(null, context, "Failure", message);
+
+    private void LogOperation(Config config, string fileName, string status, string message, long fileSize = 0, string fileHash = null)
+    {
+        try
         {
-            cmd.Parameters.AddWithValue("@MappingID", mappingID);
-            cmd.Parameters.AddWithValue("@ActionType", actionType);
-            cmd.Parameters.AddWithValue("@FileName", fileName);
-            cmd.Parameters.AddWithValue("@FileSize", fileSize);
-            cmd.Parameters.AddWithValue("@FileHash", (object)fileHash ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("@Status", status);
-            cmd.Parameters.AddWithValue("@Message", message);
-            cmd.ExecuteNonQuery();
+            int mappingID = config?.MappingID ?? -1;
+            string actionType = config?.ActionType ?? "Unknown";
+            Console.WriteLine($"[LOG] MappingID: {mappingID}, File: {fileName}, Size: {fileSize}, Hash: {fileHash}, Status: {status}, Message: {message}");
+            WriteLogToDatabase(mappingID, actionType, fileName, status, message, fileSize, fileHash);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Logging failed: {ex.Message}");
+        }
+    }
+
+    private void WriteLogToDatabase(int mappingID, string actionType, string fileName, string status, string message, long fileSize, string fileHash)
+    {
+        var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+
+        using (var conn = new SqlConnection(connStr))
+        {
+            conn.Open();
+            string query = @"INSERT INTO MoveIt.FileTransferLog 
+                    (MappingID, ActionType, FileName, FileSize, FileHash, Status, LogMessage, ProcessedAt)
+                    VALUES (@MappingID, @ActionType, @FileName, @FileSize, @FileHash, @Status, @Message, GETDATE())";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@MappingID", mappingID);
+                cmd.Parameters.AddWithValue("@ActionType", actionType);
+                cmd.Parameters.AddWithValue("@FileName", fileName);
+                cmd.Parameters.AddWithValue("@FileSize", fileSize);
+                cmd.Parameters.AddWithValue("@FileHash", (object)fileHash ?? DBNull.Value);
+                cmd.Parameters.AddWithValue("@Status", status);
+                cmd.Parameters.AddWithValue("@Message", message);
+                cmd.ExecuteNonQuery();
+            }
         }
     }
 }
-
