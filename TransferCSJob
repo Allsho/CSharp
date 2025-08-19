@@ -321,3 +321,76 @@ public class Logger
 
 ALTER TABLE MoveIt.FileTransferLog 
 ADD FileSize BIGINT NULL;
+
+
+private bool ZipFiles()
+{
+    bool zippedAnything = false;
+
+    try
+    {
+        ValidateDirectories(_config.SourceFolder, _config.DestinationFolder);
+        EnsureDirectory(_config.ArchiveFolder);
+
+        var files = GetMatchingFiles();
+
+        // Split: non-duplicates to zip, duplicates to archive
+        var toZip = files.Where(f =>
+        {
+            var fi = new FileInfo(f);
+            return !IsAlreadyProcessed(fi.Name, _config.MappingID, fi.Length);
+        }).ToArray();
+
+        var duplicates = files.Except(toZip).ToArray();
+
+        // Archive duplicates
+        foreach (var dup in duplicates)
+        {
+            MoveToArchiveSafely(dup, Path.GetFileName(dup));
+        }
+
+        if (toZip.Length == 0)
+        {
+            _logger.LogInfo(_config, "Zip", "No new files to zip (all duplicates archived).");
+            return false; // don’t create/append empty zip
+        }
+
+        var zipPath = Path.Combine(_config.DestinationFolder, $"{_config.ZipName}_{DateTime.Now:yyyyMM}.zip");
+
+        using (var zipToOpen = new FileStream(zipPath, FileMode.OpenOrCreate))
+        using (var archive = new ZipArchive(zipToOpen, ZipArchiveMode.Update))
+        {
+            foreach (var file in toZip)
+            {
+                var fileName = Path.GetFileName(file);
+                try
+                {
+                    bool entryExists = archive.Entries.Any(e =>
+                        string.Equals(e.Name, fileName, StringComparison.OrdinalIgnoreCase));
+
+                    if (!entryExists)
+                    {
+                        archive.CreateEntryFromFile(file, fileName);
+                        zippedAnything = true;
+                        _logger.LogSuccess(_config, fileName, "Appended to Zip", new FileInfo(file).Length);
+                    }
+                    else
+                    {
+                        _logger.LogInfo(_config, fileName, "Skipped (already in zip).");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError($"Zip:{fileName}", ex.Message, new FileInfo(file).Length);
+                }
+            }
+        }
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError("ZipFiles", ex.Message);
+    }
+
+    return zippedAnything;
+}
+
