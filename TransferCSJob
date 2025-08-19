@@ -14,6 +14,8 @@ public class FileProcessor
     public void Execute()
     {
         bool anyNewProcessed = false;
+        var filesInFolder = GetMatchingFiles();
+        bool hasFiles = filesInFolder.Length > 0;
 
         switch (_config.ActionType)
         {
@@ -30,13 +32,14 @@ public class FileProcessor
                 throw new Exception($"Unknown ActionType: {_config.ActionType}");
         }
 
-        // If this is Sequence 1 and nothing new was processed
-        if (_config.Sequence == 1 && !anyNewProcessed)
+        // Only log once if there were files but none were new
+        if (_config.Sequence == 1 && hasFiles && !anyNewProcessed)
         {
             try
             {
                 _vars["User::HasFiles"].Value = false;
-                _logger.LogInfo(_config, "AllDuplicates", "All files were previously processed; archived and skipping later sequences.");
+                _logger.LogInfo(_config, "AllDuplicates",
+                    "All files were duplicates and moved to archive; skipping further actions.");
             }
             catch (Exception ex)
             {
@@ -69,11 +72,12 @@ public class FileProcessor
                 var fileName = Path.GetFileName(file);
                 long fileSize = new FileInfo(file).Length;
 
-                // Duplicate → move to ArchiveFolder and skip normal action
+                // Duplicate → move to ArchiveFolder and log once
                 if (IsAlreadyProcessed(fileName, _config.MappingID, fileSize))
                 {
                     MoveToArchiveSafely(file, fileName);
-                    _logger.LogInfo(_config, fileName, $"File {fileName} with size {fileSize} already processed. Skipping further actions. ");
+                    _logger.LogInfo(_config, fileName,
+                        $"File {fileName} with size {fileSize} already processed. Skipping further actions.");
                     continue;
                 }
 
@@ -118,7 +122,6 @@ public class FileProcessor
 
             var files = GetMatchingFiles();
 
-            // Split: non-duplicates to zip, duplicates to archive
             var toZip = files.Where(f =>
             {
                 var fi = new FileInfo(f);
@@ -127,12 +130,13 @@ public class FileProcessor
 
             var duplicates = files.Except(toZip).ToArray();
 
-            // Archive duplicates
+            // Archive duplicates and log once
             foreach (var dup in duplicates)
             {
                 long fileSize = new FileInfo(dup).Length;
                 MoveToArchiveSafely(dup, Path.GetFileName(dup));
-                _logger.LogInfo(_config, Path.GetFileName(dup), $"File {Path.GetFileName(dup)} with size {fileSize} are processed. Move to archive.");
+                _logger.LogInfo(_config, Path.GetFileName(dup),
+                    $"File {Path.GetFileName(dup)} with size {fileSize} already processed. Moved to archive.");
             }
 
             if (toZip.Length == 0)
@@ -228,10 +232,10 @@ public class FileProcessor
         {
             conn.Open();
             string query = @"SELECT COUNT(*) FROM MoveIt.FileTransferLog 
-                         WHERE FileName = @FileName 
-                           AND MappingID = @MappingID 
-                           AND FileSize = @FileSize
-                           AND Status = 'Success'";
+                             WHERE FileName = @FileName 
+                               AND MappingID = @MappingID 
+                               AND FileSize = @FileSize
+                               AND Status = 'Success'";
             using (SqlCommand cmd = new SqlCommand(query, conn))
             {
                 cmd.Parameters.AddWithValue("@FileName", fileName);
