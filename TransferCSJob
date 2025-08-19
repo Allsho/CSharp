@@ -263,3 +263,51 @@ public class FileProcessor
         }
     }
 }
+
+ public void Main()
+ {
+     try
+     {
+         var config = Config.LoadFromVariables(Dts.Variables);
+
+         if (!ShouldProcess(config))
+         {
+             Dts.TaskResult = (int)ScriptResults.Success;
+             return;
+         }
+
+         // CHANGE: pass Dts.Variables into FileProcessor
+         var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables);
+         processor.Execute();
+
+         Dts.TaskResult = (int)ScriptResults.Success;
+     }
+     catch (Exception ex)
+     {
+         Console.WriteLine($"Error in Main(): {ex.Message}");
+         new Logger(Dts.Variables).LogError("Main", ex.Message);
+         Dts.TaskResult = (int)ScriptResults.Failure;
+     }
+ }
+
+ private bool ShouldProcess(Config config)
+ {
+     if (config.Sequence == 1)
+     {
+         var files = FileProcessor.GetFilesByPatternAndDate(config.SourceFolder, config.FilePattern, DateTime.Now);
+         if (!files.Any())
+         {
+             new Logger(Dts.Variables).LogInfo(config, "No Files Found", $"Skipped - No files found for {config.PayerName}.");
+             return false;
+         }
+         config.HasFiles = true;
+         Dts.Variables["User::HasFiles"].Value = true;
+         Dts.Variables["User::CurrentPayer"].Value = config.PayerName;
+     }
+     else if (config.PayerName != config.CurrentPayer || !config.HasFiles)
+     {
+         new Logger(Dts.Variables).LogInfo(config, "No Files Found", "Skipped - Seq1 had no files.");
+         return false;
+     }
+     return true;
+ }
