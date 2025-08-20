@@ -1,123 +1,147 @@
+EmailSummary.cs
+
 using System;
-using System.Data.SqlClient;
-using System.Net;
-using System.Net.Mail;
+using System.Collections.Generic;
 using System.Text;
+
+public class EmailSummary
+{
+    public class FileLogEntry
+    {
+        public string FileName { get; set; }
+        public string Action { get; set; }
+        public long FileSize { get; set; }
+        public string Status { get; set; }
+    }
+
+    private readonly List<FileLogEntry> _entries = new List<FileLogEntry>();
+
+    public void AddEntry(string fileName, string action, long fileSize, string status)
+    {
+        _entries.Add(new FileLogEntry
+        {
+            FileName = fileName,
+            Action = action,
+            FileSize = fileSize,
+            Status = status
+        });
+    }
+
+    public string GenerateHtml()
+    {
+        if (_entries.Count == 0)
+            return "<p>No files processed.</p>";
+
+        var sb = new StringBuilder();
+        sb.AppendLine("<h3>File Processing Summary</h3>");
+        sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>");
+        sb.AppendLine("<tr style='background-color:#f2f2f2;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th></tr>");
+
+        foreach (var entry in _entries)
+        {
+            sb.AppendLine($"<tr><td>{entry.FileName}</td><td>{entry.Action}</td><td>{entry.FileSize}</td><td>{entry.Status}</td></tr>");
+        }
+
+        sb.AppendLine("</table>");
+        return sb.ToString();
+    }
+}
+
+Emailer.cs
+
+using System.Net.Mail;
 using Microsoft.SqlServer.Dts.Runtime;
 
-namespace FileETL
+public class Emailer
 {
-    public class Emailer
+    private readonly Variables _vars;
+
+    public Emailer(Variables vars)
     {
-        private readonly ConnectionManager _smtpConn;
-        private readonly string _logConnStr;
+        _vars = vars;
+    }
 
-        public Emailer(ConnectionManager smtpConn, string logConnStr)
+    public void SendEmail(ConnectionManager smtpConnection, string subject, string htmlBody, string payerName)
+    {
+        try
         {
-            _smtpConn = smtpConn ?? throw new ArgumentNullException(nameof(smtpConn));
-            _logConnStr = logConnStr ?? throw new ArgumentNullException(nameof(logConnStr));
-        }
+            // Get SMTP properties from SSIS Connection Manager
+            string from = smtpConnection.Properties["From"].GetValue(smtpConnection).ToString();
+            string to = smtpConnection.Properties["To"].GetValue(smtpConnection).ToString();
+            string cc = smtpConnection.Properties["CC"].GetValue(smtpConnection)?.ToString() ?? string.Empty;
 
-        public void SendEmail(string subject, string body, string to, string from = null)
-        {
-            try
+            using (var message = new MailMessage(from, to))
             {
-                var smtpConfig = (SmtpClientConnection)_smtpConn.InnerObject;
+                message.Subject = subject;
+                message.Body = htmlBody;
+                message.IsBodyHtml = true;
+                if (!string.IsNullOrWhiteSpace(cc))
+                    message.CC.Add(cc);
 
-                using (SmtpClient smtp = new SmtpClient(smtpConfig.ServerName, smtpConfig.Port))
+                using (var client = new SmtpClient())
                 {
-                    smtp.DeliveryMethod = SmtpDeliveryMethod.Network;
-
-                    if (smtpConfig.UseWindowsAuthentication)
-                        smtp.UseDefaultCredentials = true;
-                    else if (!string.IsNullOrEmpty(smtpConfig.UserName))
-                        smtp.Credentials = new NetworkCredential(smtpConfig.UserName, smtpConfig.Password);
-
-                    MailMessage msg = new MailMessage
-                    {
-                        Subject = subject,
-                        Body = body,
-                        From = new MailAddress(from ?? smtpConfig.SenderEmail),
-                        IsBodyHtml = false
-                    };
-                    msg.To.Add(to);
-                    smtp.Send(msg);
-                }
-            }
-            catch (Exception ex)
-            {
-                throw new ApplicationException($"Email send failed: {ex.Message}", ex);
-            }
-        }
-
-        public void SendSuccessSummary(string payerName, int mappingID, string to)
-        {
-            string body = $"The ETL job completed successfully for payer: {payerName}\n\nFiles processed:\n";
-
-            using (var conn = new SqlConnection(_logConnStr))
-            {
-                conn.Open();
-                string query = @"SELECT FileName, FileSize, Status 
-                                 FROM MoveIt.FileTransferLog 
-                                 WHERE MappingID = @MappingID 
-                                   AND CAST(ProcessedAt AS DATE) = CAST(GETDATE() AS DATE)
-                                 ORDER BY FileName";
-
-                using (var cmd = new SqlCommand(query, conn))
-                {
-                    cmd.Parameters.AddWithValue("@MappingID", mappingID);
-
-                    using (var reader = cmd.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            string file = reader.GetString(0);
-                            long size = reader.GetInt64(1);
-                            string status = reader.GetString(2);
-
-                            body += $"- {file} ({size / 1024} KB) → {status}\n";
-                        }
-                    }
+                    client.Send(message);
                 }
             }
 
-            SendEmail($"ETL Success - {payerName}", body, to);
+            // Optional: store email info in DB
+            SaveEmailRecordToDb(from, to, cc, subject, htmlBody, payerName);
         }
-
-        public void SendFailure(string payerName, string error, string to)
+        catch (Exception ex)
         {
-            SendEmail(
-                $"ETL Failure - {payerName}",
-                $"The ETL job failed for payer: {payerName}\n\nError: {error}",
-                to
-            );
+            Console.WriteLine($"Email sending failed: {ex.Message}");
+        }
+    }
+
+    private void SaveEmailRecordToDb(string from, string to, string cc, string subject, string body, string payerName)
+    {
+        var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+
+        using (var conn = new System.Data.SqlClient.SqlConnection(connStr))
+        {
+            conn.Open();
+            string query = @"INSERT INTO MoveIt.EmailLog
+                            (Sender, Recipients, CC, Subject, Body, PayerName, SentAt)
+                            VALUES (@Sender, @Recipients, @CC, @Subject, @Body, @PayerName, GETDATE())";
+
+            using (var cmd = new System.Data.SqlClient.SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@Sender", from);
+                cmd.Parameters.AddWithValue("@Recipients", to);
+                cmd.Parameters.AddWithValue("@CC", cc);
+                cmd.Parameters.AddWithValue("@Subject", subject);
+                cmd.Parameters.AddWithValue("@Body", body);
+                cmd.Parameters.AddWithValue("@PayerName", payerName);
+                cmd.ExecuteNonQuery();
+            }
         }
     }
 }
 
 
-try
+//Main.cs
+
+public void Main()
 {
-    var config = Config.LoadFromVariables(Dts.Variables);
-    var logger = new Logger(Dts.Variables);
+    try
+    {
+        var config = Config.LoadFromVariables(Dts.Variables);
+        var summary = new EmailSummary();
+        var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables, summary);
+        processor.Execute();
 
-    var processor = new FileProcessor(config, logger, Dts.Variables);
-    processor.Execute();
+        // Send summary email
+        var emailer = new Emailer(Dts.Variables);
+        string htmlBody = summary.GenerateHtml();
+        emailer.SendEmail(Dts.Connections["CM_SMTP"], "File Processing Summary", htmlBody, config.PayerName);
 
-    // Send email summary with file names & sizes
-    var emailer = new Emailer(Dts.Connections["CM_SMTP"], Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString());
-    emailer.SendSuccessSummary(config.PayerName, config.MappingID, "team@yourdomain.com");
-
-    Dts.TaskResult = (int)ScriptResults.Success;
+        Dts.TaskResult = (int)ScriptResults.Success;
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Error in Main(): {ex.Message}");
+        new Logger(Dts.Variables).LogError("Main", ex.Message);
+        Dts.TaskResult = (int)ScriptResults.Failure;
+    }
 }
-catch (Exception ex)
-{
-    Console.WriteLine($"Error in Main(): {ex.Message}");
-    new Logger(Dts.Variables).LogError("Main", ex.Message);
 
-    var config = Config.LoadFromVariables(Dts.Variables);
-    var emailer = new Emailer(Dts.Connections["CM_SMTP"], Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString());
-    emailer.SendFailure(config.PayerName, ex.Message, "team@yourdomain.com");
-
-    Dts.TaskResult = (int)ScriptResults.Failure;
-}
