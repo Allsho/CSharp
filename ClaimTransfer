@@ -1,117 +1,64 @@
-EmailSummary.cs
-
-using System;
-using System.Collections.Generic;
-using System.Text;
-
-public class EmailSummary
-{
-    public class FileLogEntry
-    {
-        public string FileName { get; set; }
-        public string Action { get; set; }
-        public long FileSize { get; set; }
-        public string Status { get; set; }
-    }
-
-    private readonly List<FileLogEntry> _entries = new List<FileLogEntry>();
-
-    public void AddEntry(string fileName, string action, long fileSize, string status)
-    {
-        _entries.Add(new FileLogEntry
-        {
-            FileName = fileName,
-            Action = action,
-            FileSize = fileSize,
-            Status = status
-        });
-    }
-
-    public string GenerateHtml()
-    {
-        if (_entries.Count == 0)
-            return "<p>No files processed.</p>";
-
-        var sb = new StringBuilder();
-        sb.AppendLine("<h3>File Processing Summary</h3>");
-        sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>");
-        sb.AppendLine("<tr style='background-color:#f2f2f2;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th></tr>");
-
-        foreach (var entry in _entries)
-        {
-            sb.AppendLine($"<tr><td>{entry.FileName}</td><td>{entry.Action}</td><td>{entry.FileSize}</td><td>{entry.Status}</td></tr>");
-        }
-
-        sb.AppendLine("</table>");
-        return sb.ToString();
-    }
-}
-
-Emailer.cs
-
-using System.Net.Mail;
-using Microsoft.SqlServer.Dts.Runtime;
-
-public class Emailer
+public class Logger
 {
     private readonly Variables _vars;
+    private readonly EmailSummary _summary;
 
-    public Emailer(Variables vars)
+    public Logger(Variables vars, EmailSummary summary = null)
     {
         _vars = vars;
+        _summary = summary;
     }
 
-    public void SendEmail(ConnectionManager smtpConnection, string subject, string htmlBody, string payerName)
+    public void LogInfo(Config config, string fileName, string message, long fileSize = 0) =>
+        LogOperation(config, fileName, "Info", message, fileSize);
+
+    public void LogSuccess(Config config, string fileName, string action, long fileSize = 0) =>
+        LogOperation(config, fileName, "Success", $"File {action} successfully.", fileSize);
+
+    public void LogError(string context, string message, long fileSize = 0) =>
+        LogOperation(null, context, "Failure", message, fileSize);
+
+    private void LogOperation(Config config, string fileName, string status, string message, long fileSize = 0)
     {
         try
         {
-            // Get SMTP properties from SSIS Connection Manager
-            string from = smtpConnection.Properties["From"].GetValue(smtpConnection).ToString();
-            string to = smtpConnection.Properties["To"].GetValue(smtpConnection).ToString();
-            string cc = smtpConnection.Properties["CC"].GetValue(smtpConnection)?.ToString() ?? string.Empty;
+            int mappingID = config?.MappingID ?? -1;
+            string actionType = config?.ActionType ?? "Unknown";
 
-            using (var message = new MailMessage(from, to))
-            {
-                message.Subject = subject;
-                message.Body = htmlBody;
-                message.IsBodyHtml = true;
-                if (!string.IsNullOrWhiteSpace(cc))
-                    message.CC.Add(cc);
+            // Console log
+            Console.WriteLine($"[LOG] MappingID: {mappingID}, File: {fileName}, Size: {fileSize}, Status: {status}, Message: {message}");
 
-                using (var client = new SmtpClient())
-                {
-                    client.Send(message);
-                }
-            }
+            // Database log
+            WriteLogToDatabase(mappingID, actionType, fileName, status, message, fileSize);
 
-            // Optional: store email info in DB
-            SaveEmailRecordToDb(from, to, cc, subject, htmlBody, payerName);
+            // Add to email summary if available
+            _summary?.AddEntry(fileName, actionType, fileSize, status);
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Email sending failed: {ex.Message}");
+            Console.WriteLine($"Logging failed: {ex.Message}");
         }
     }
 
-    private void SaveEmailRecordToDb(string from, string to, string cc, string subject, string body, string payerName)
+    private void WriteLogToDatabase(int mappingID, string actionType, string fileName, string status, string message, long fileSize)
     {
         var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
 
-        using (var conn = new System.Data.SqlClient.SqlConnection(connStr))
+        using (var conn = new SqlConnection(connStr))
         {
             conn.Open();
-            string query = @"INSERT INTO MoveIt.EmailLog
-                            (Sender, Recipients, CC, Subject, Body, PayerName, SentAt)
-                            VALUES (@Sender, @Recipients, @CC, @Subject, @Body, @PayerName, GETDATE())";
+            string query = @"INSERT INTO MoveIt.FileTransferLog 
+                            (MappingID, ActionType, FileName, FileSize, Status, LogMessage, ProcessedAt)
+                            VALUES (@MappingID, @ActionType, @FileName, @FileSize, @Status, @Message, GETDATE())";
 
-            using (var cmd = new System.Data.SqlClient.SqlCommand(query, conn))
+            using (var cmd = new SqlCommand(query, conn))
             {
-                cmd.Parameters.AddWithValue("@Sender", from);
-                cmd.Parameters.AddWithValue("@Recipients", to);
-                cmd.Parameters.AddWithValue("@CC", cc);
-                cmd.Parameters.AddWithValue("@Subject", subject);
-                cmd.Parameters.AddWithValue("@Body", body);
-                cmd.Parameters.AddWithValue("@PayerName", payerName);
+                cmd.Parameters.AddWithValue("@MappingID", mappingID);
+                cmd.Parameters.AddWithValue("@ActionType", actionType);
+                cmd.Parameters.AddWithValue("@FileName", fileName);
+                cmd.Parameters.AddWithValue("@FileSize", fileSize);
+                cmd.Parameters.AddWithValue("@Status", status);
+                cmd.Parameters.AddWithValue("@Message", message);
                 cmd.ExecuteNonQuery();
             }
         }
@@ -127,7 +74,11 @@ public void Main()
     {
         var config = Config.LoadFromVariables(Dts.Variables);
         var summary = new EmailSummary();
-        var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables, summary);
+
+        // Pass summary to Logger
+        var logger = new Logger(Dts.Variables, summary);
+
+        var processor = new FileProcessor(config, logger, Dts.Variables);
         processor.Execute();
 
         // Send summary email
@@ -144,4 +95,3 @@ public void Main()
         Dts.TaskResult = (int)ScriptResults.Failure;
     }
 }
-
