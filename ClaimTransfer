@@ -6,13 +6,46 @@ CREATE TABLE MoveIt.EmailAddresses
     CC NVARCHAR(500) NULL
 );
 
-private (string Sender, string Recipient, string CC) GetEmailAddresses(string payerName)
+public void SendEmail(ConnectionManager smtpConnection, string subject, string htmlBody, string payerName)
+{
+    try
+    {
+        // Keep 'from' from the SMTP connection manager (environmental variable)
+        string from = smtpConnection.Properties["From"].GetValue(smtpConnection).ToString();
+
+        // Get recipients and CC from SQL table
+        var addresses = GetEmailAddressesFromDb(payerName);
+
+        using (var message = new MailMessage(from, addresses.Recipient))
+        {
+            message.Subject = subject;
+            message.Body = htmlBody;
+            message.IsBodyHtml = true;
+            if (!string.IsNullOrWhiteSpace(addresses.CC))
+                message.CC.Add(addresses.CC);
+
+            using (var client = new SmtpClient())
+            {
+                client.Send(message);
+            }
+        }
+
+        // Optional: store email info in DB
+        SaveEmailRecordToDb(from, addresses.Recipient, addresses.CC, subject, htmlBody, payerName);
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"Email sending failed: {ex.Message}");
+    }
+}
+
+private (string Recipient, string CC) GetEmailAddressesFromDb(string payerName)
 {
     var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
     using (var conn = new SqlConnection(connStr))
     {
         conn.Open();
-        string query = @"SELECT Sender, Recipient, CC 
+        string query = @"SELECT Recipient, CC 
                          FROM MoveIt.EmailAddresses 
                          WHERE PayerName = @PayerName";
         using (var cmd = new SqlCommand(query, conn))
@@ -23,7 +56,6 @@ private (string Sender, string Recipient, string CC) GetEmailAddresses(string pa
                 if (reader.Read())
                 {
                     return (
-                        Sender: reader["Sender"].ToString(),
                         Recipient: reader["Recipient"].ToString(),
                         CC: reader["CC"]?.ToString() ?? string.Empty
                     );
@@ -31,21 +63,5 @@ private (string Sender, string Recipient, string CC) GetEmailAddresses(string pa
             }
         }
     }
-    return (Sender: string.Empty, Recipient: string.Empty, CC: string.Empty);
-}
-
-var addresses = GetEmailAddresses(payerName);
-
-using (var message = new MailMessage(addresses.Sender, addresses.Recipient))
-{
-    message.Subject = subject;
-    message.Body = htmlBody;
-    message.IsBodyHtml = true;
-    if (!string.IsNullOrWhiteSpace(addresses.CC))
-        message.CC.Add(addresses.CC);
-
-    using (var client = new SmtpClient())
-    {
-        client.Send(message);
-    }
+    return (Recipient: string.Empty, CC: string.Empty);
 }
