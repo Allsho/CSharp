@@ -1,97 +1,45 @@
-public class Logger
+CREATE TABLE EmailTemplates (
+    EmailID INT IDENTITY(1,1) PRIMARY KEY,
+    SenderEmail NVARCHAR(255) NOT NULL,
+    RecipientEmails NVARCHAR(MAX) NOT NULL, -- can be comma-separated list
+    Subject NVARCHAR(500) NOT NULL,
+    Body NVARCHAR(MAX) NOT NULL, -- supports HTML
+    CreatedDate DATETIME DEFAULT GETDATE()
+);
+
+INSERT INTO EmailTemplates (SenderEmail, RecipientEmails, Subject, Body)
+VALUES (
+    'no-reply@mycompany.com',
+    'user1@mycompany.com;user2@mycompany.com',
+    'File Archive Summary',
+    '<h2>Archive Process Completed</h2><p>10 files moved successfully to archive.</p>'
+);
+
+
+public EmailTemplate GetEmailTemplate(int emailId)
 {
-    private readonly Variables _vars;
-    private readonly EmailSummary _summary;
-
-    public Logger(Variables vars, EmailSummary summary = null)
+    using (SqlConnection conn = new SqlConnection(_connectionString))
     {
-        _vars = vars;
-        _summary = summary;
-    }
+        conn.Open();
+        string query = "SELECT SenderEmail, RecipientEmails, Subject, Body FROM EmailTemplates WHERE EmailID = @EmailID";
 
-    public void LogInfo(Config config, string fileName, string message, long fileSize = 0) =>
-        LogOperation(config, fileName, "Info", message, fileSize);
-
-    public void LogSuccess(Config config, string fileName, string action, long fileSize = 0) =>
-        LogOperation(config, fileName, "Success", $"File {action} successfully.", fileSize);
-
-    public void LogError(string context, string message, long fileSize = 0) =>
-        LogOperation(null, context, "Failure", message, fileSize);
-
-    private void LogOperation(Config config, string fileName, string status, string message, long fileSize = 0)
-    {
-        try
+        using (SqlCommand cmd = new SqlCommand(query, conn))
         {
-            int mappingID = config?.MappingID ?? -1;
-            string actionType = config?.ActionType ?? "Unknown";
-
-            // Console log
-            Console.WriteLine($"[LOG] MappingID: {mappingID}, File: {fileName}, Size: {fileSize}, Status: {status}, Message: {message}");
-
-            // Database log
-            WriteLogToDatabase(mappingID, actionType, fileName, status, message, fileSize);
-
-            // Add to email summary if available
-            _summary?.AddEntry(fileName, actionType, fileSize, status);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Logging failed: {ex.Message}");
-        }
-    }
-
-    private void WriteLogToDatabase(int mappingID, string actionType, string fileName, string status, string message, long fileSize)
-    {
-        var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-
-        using (var conn = new SqlConnection(connStr))
-        {
-            conn.Open();
-            string query = @"INSERT INTO MoveIt.FileTransferLog 
-                            (MappingID, ActionType, FileName, FileSize, Status, LogMessage, ProcessedAt)
-                            VALUES (@MappingID, @ActionType, @FileName, @FileSize, @Status, @Message, GETDATE())";
-
-            using (var cmd = new SqlCommand(query, conn))
+            cmd.Parameters.AddWithValue("@EmailID", emailId);
+            using (SqlDataReader reader = cmd.ExecuteReader())
             {
-                cmd.Parameters.AddWithValue("@MappingID", mappingID);
-                cmd.Parameters.AddWithValue("@ActionType", actionType);
-                cmd.Parameters.AddWithValue("@FileName", fileName);
-                cmd.Parameters.AddWithValue("@FileSize", fileSize);
-                cmd.Parameters.AddWithValue("@Status", status);
-                cmd.Parameters.AddWithValue("@Message", message);
-                cmd.ExecuteNonQuery();
+                if (reader.Read())
+                {
+                    return new EmailTemplate
+                    {
+                        SenderEmail = reader.GetString(0),
+                        RecipientEmails = reader.GetString(1),
+                        Subject = reader.GetString(2),
+                        Body = reader.GetString(3)
+                    };
+                }
             }
         }
     }
-}
-
-
-//Main.cs
-
-public void Main()
-{
-    try
-    {
-        var config = Config.LoadFromVariables(Dts.Variables);
-        var summary = new EmailSummary();
-
-        // Pass summary to Logger
-        var logger = new Logger(Dts.Variables, summary);
-
-        var processor = new FileProcessor(config, logger, Dts.Variables);
-        processor.Execute();
-
-        // Send summary email
-        var emailer = new Emailer(Dts.Variables);
-        string htmlBody = summary.GenerateHtml();
-        emailer.SendEmail(Dts.Connections["CM_SMTP"], "File Processing Summary", htmlBody, config.PayerName);
-
-        Dts.TaskResult = (int)ScriptResults.Success;
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error in Main(): {ex.Message}");
-        new Logger(Dts.Variables).LogError("Main", ex.Message);
-        Dts.TaskResult = (int)ScriptResults.Failure;
-    }
+    return null;
 }
