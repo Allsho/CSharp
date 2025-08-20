@@ -1,381 +1,783 @@
-// Script Main
-public void Main()
-{
-    string connString = Dts.Variables["User::CM_OLEDB_RADB"].Value.ToString();
-    string folderPath = Dts.Variables["User::folderOutboundYaleHealth"].Value.ToString();
+ public void Main()
+ {
+     string connStr = Dts.Variables["User::CM_OLEDB_CS"].Value.ToString();
+     string basePath = Dts.Variables["User::prmRootPath"].Value.ToString();
+     string idList = Dts.Variables["User::FilteredMappingIDs"].Value.ToString();
 
-    const int maxConcurrentTasks = 5;
-    using (var semaphore = new SemaphoreSlim(maxConcurrentTasks))
-    {
-        try
-        {
-            using (var conn = SqlHelper.CreateConnection(connString))
-            {
-                var configurations = ConfigLoader.LoadConfigurations(conn);
+     // Setup SMTP Connection
+     ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
+     string smtpServer = smtpConnection.Properties["SmtpServer"].GetValue(smtpConnection).ToString();
+     bool success = true;
 
-                // Separate critical and non-critical tasks
-                var criticalTasks = configurations.Where(c => c.IsCritical).OrderBy(c => c.EtlProcessingOrder).ToList();
-                var nonCriticalTasks = configurations.Where(c => !c.IsCritical).ToList();
+     try
+     {
+         Logger.Log(connStr, "ETL Process Started");
+         List<TableMapping> mappings = GetTableMappings(connStr);
 
-                // Process critical tasks sequentially
-                foreach (var config in criticalTasks)
-                {
-                    TaskRunner.RetryTask(() => TaskRunner.ExecuteTask(connString, config, folderPath), 3, config.WaitTimeMinutes);
-                }
+         using (SqlConnection conn = new SqlConnection(connStr))
+         {
+             conn.Open();
+             foreach (var mapping in mappings)
+             {
+                 List<ColumnMapping> columnMappings = GetColumnMappings(conn, mapping.TargetTable);
+                 ProcessFiles(conn, mapping, columnMappings, basePath);
+             }
+         }
 
-                // Process non-critical tasks in parallel
-                var tasks = new List<System.Threading.Tasks.Task>();
-                foreach (var config in nonCriticalTasks)
-                {
-                    tasks.Add(TaskRunner.RunTaskAsync(semaphore, connString, config, folderPath));
-                }
+         Logger.Log(connStr, "ETL Process Completed");
+     }
+     catch (Exception ex)
+     {
+         success = false;
+         LogError(connStr, "General Error", ex.Message);
+         Dts.TaskResult = (int)ScriptResults.Failure;
+     }
+     finally
+     {
+         //SendSummaryEmail(connStr, idList, smtpServer);
+         Dts.TaskResult = success ? (int)ScriptResults.Success : (int)ScriptResults.Failure;
+     }
 
-                System.Threading.Tasks.Task.WaitAll(tasks.ToArray());
-                Dts.TaskResult = (int)ScriptResults.Success;
-            }
-        }
-        catch (Exception ex)
-        {
-            Dts.Events.FireError(0, "SSIS Script Task", $"Critical error: {ex.Message}\nStackTrace: {ex.StackTrace}", string.Empty, 0);
-            Dts.TaskResult = (int)ScriptResults.Failure;
-        }
-    }
-}
+     Dts.TaskResult = (int)ScriptResults.Success;
+ }
 
-//ConfigLoader.cs
-internal static class ConfigLoader
-{
-    internal static List<StoredProcConfig> LoadConfigurations(SqlConnection conn)
-    {
-        const string query = @"
-                SELECT 
-                    Clarity_ObjectName,
-                    EtlProcessStep,
-                    EtlProcessingOrder,
-                    EtlOutputFileName,
-                    StoredProcedureName,
-                    StoredProcedureExecuteStatement,
-                    IsCritical,
-                    MaxFileSize,
-                    WaitTimeMinutes,
-                    IsActive,
-                    RetryAttempts
-                FROM YHP.YaleHealth_ETL_Objects
-                WHERE
-                    StoredProcedureName IS NOT NULL
-                    AND IsActive = 1
-                ORDER BY 
-                    IsCritical DESC, 
-                    EtlProcessingOrder;";
+ public class TableMapping
+ {
+     public string TargetTable;
+     public string FilePattern;
+     public string FileType;
+     public string SourcePath;
+     public string ArchivePath;
+     public string Delimiter;
+     //public string PostLoadProcedure;
+     //Add Excel Info
+     public string SheetName;
+     public int HeaderRowIndex = 1; // Default to 1 (Excel rows are 1-based)
+ }
 
-        var configurations = new List<StoredProcConfig>();
-        try
-        {
-            using (var cmd = new SqlCommand(query, conn))
-            {
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        configurations.Add(new StoredProcConfig
-                        {
-                            StoredProcName = reader["StoredProcedureName"].ToString(),
-                            FileNameTemplate = reader["EtlOutputFileName"].ToString(),
-                            MaxFileLength = Convert.ToInt32(reader["MaxFileSize"]),
-                            IsCritical = Convert.ToBoolean(reader["IsCritical"]),
-                            EtlProcessingOrder = Convert.ToInt32(reader["EtlProcessingOrder"]),
-                            WaitTimeMinutes = Convert.ToInt32(reader["WaitTimeMinutes"]),
-                            RetryAttempts = Convert.ToInt32(reader["RetryAttempts"])
-                        });
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogExecution(conn, "LoadConfigurations", "Failure", $"Failed to load configurations: {ex.Message}", stackTrace: ex.StackTrace);
-        }
-        return configurations;
-    }
-}
+ public class ColumnMapping
+ {
+     public string IncomingColumn;
+     public string TargetColumn;
+     public bool IsRequired;
+     public string DataType;
+ }
 
-// Logger.cs
-internal static class Logger
-{
-    internal static void LogExecution(SqlConnection conn, string storedProcName, string status, string message,
-                                        int bytesWritten = 0, int fileCounter = 0, double? writeDuration = null, string stackTrace = null, int logId = 0)
-    {
-        const string logQuery = @"
-                INSERT INTO dbo.YaleHealthExecutionLog 
-                (StoredProcName, ExecutionStatus, Message, StackTrace, BytesWritten, FileCounter, WriteDurationMilliseconds, LogDate, DBLogId)
-                VALUES (@StoredProcName, @ExecutionStatus, @Message, @StackTrace, @BytesWritten, @FileCounter, @WriteDuration, GETDATE(), @LogId)";
+ public List<TableMapping> GetTableMappings(string connStr)
+ {
+     var mappings = new List<TableMapping>();
 
-        using (var logCmd = new SqlCommand(logQuery, conn))
-        {
-            logCmd.Parameters.AddWithValue("@StoredProcName", storedProcName);
-            logCmd.Parameters.AddWithValue("@ExecutionStatus", status);
-            logCmd.Parameters.AddWithValue("@Message", message);
-            logCmd.Parameters.AddWithValue("@StackTrace", (object)stackTrace ?? DBNull.Value);
-            logCmd.Parameters.AddWithValue("@BytesWritten", bytesWritten);
-            logCmd.Parameters.AddWithValue("@FileCounter", fileCounter);
-            logCmd.Parameters.AddWithValue("@WriteDuration", writeDuration.HasValue ? writeDuration.Value : (object)DBNull.Value);
-            logCmd.Parameters.AddWithValue("@LogId", logId);
-            logCmd.ExecuteNonQuery();
-        }
-    }
-}
+     try
+     {
+         string idList = Dts.Variables["User::FilteredMappingIDs"].Value.ToString();
 
-// SqlHelper.cs
-internal static class SqlHelper
-{
-    internal static SqlConnection CreateConnection(string connString)
-    {
-        var conn = new SqlConnection(connString);
-        conn.Open();
-        return conn;
+         using (SqlConnection conn = new SqlConnection(connStr))
+         using (SqlCommand cmd = new SqlCommand("ETL.usp_Get_Table_Mappings_ByIds", conn))
+         {
+             cmd.CommandType = CommandType.StoredProcedure;
+             cmd.Parameters.AddWithValue("@MappingIds", idList);
+             conn.Open();
 
-    }
-       
-}
+             using (SqlDataReader rdr = cmd.ExecuteReader())
+             {
+                 while (rdr.Read())
+                 {
+                     mappings.Add(new TableMapping
+                     {
+                         TargetTable = rdr["TargetTable"].ToString(),
+                         FilePattern = rdr["FilePattern"].ToString(),
+                         FileType = rdr["FileType"].ToString(),
+                         SourcePath = rdr["SourcePath"].ToString(),
+                         ArchivePath = rdr["ArchivePath"].ToString(),
+                         Delimiter = rdr["Delimiter"].ToString(),
+                        // PostLoadProcedure = rdr["PostLoadProcedure"].ToString(),
+                         SheetName = rdr["SheetName"].ToString(),
+                         HeaderRowIndex = rdr["HeaderRowIndex"] != DBNull.Value ? Convert.ToInt32(rdr["HeaderRowIndex"]) : 1
+                     });
+                 }
+             }
+         }
+     }
+     catch (Exception ex)
+     {
+         LogError(connStr, "Error in GetTableMappings", ex.Message);
+     }
 
-// StoredProcConfig.cs
-internal class StoredProcConfig
-{
-    public string StoredProcName { get; set; }
-    public string FileNameTemplate { get; set; }
-    public int MaxFileLength { get; set; }
-    public bool IsCritical { get; set; }
-    public int EtlProcessingOrder { get; set; }    
-    public int WaitTimeMinutes { get; set; }
-    public int RetryAttempts {  get; set; }
-}
+     return mappings;
+ }
 
-// StoredProcExecutor.cs
-internal static class StoredProcExecutor
-{
-    /// <summary>
-    /// Executes a stored procedure and exports the results to a file.
-    /// </summary>
-    /// <param name="conn">An open SQL connection.</param>
-    /// <param name="storedProcName"></param>
-    /// <param name="folderPath">Path to the folder where the output files will be stored.</param>
-    /// <param name="fileNameTemplate"></param>
-    /// <param name="maxFileLength"></param>
-    internal static void ExecuteAndExport(SqlConnection conn, string storedProcName, string folderPath,
-                                            string fileNameTemplate, int maxFileLength)
-    {
-        int fileCounter = 1;
-        int bytesWritten = 0;
-        var buffer = new StringBuilder(8192);
-        bool headerWritten = false;
-        bool hasData = false; // Track if the procedure returned any rows
+ public List<ColumnMapping> GetColumnMappings(SqlConnection conn, string targetTable)
+ {
+     List<ColumnMapping> list = new List<ColumnMapping>();
 
-        try
-        {
-            using (var cmd = new SqlCommand(storedProcName, conn))
-            {
-                cmd.CommandType = CommandType.StoredProcedure;
+     string sql = @"SELECT cdm.IncomingColumnName AS IncomingColumn, cdm.StandardizedColumnName AS TargetColumn, ISNULL(cdm.IsRequired, 0) AS IsRequired, cdm.DataType AS DataType
+            FROM ETL.Claim_Data_Mapping cdm
+            JOIN ETL.Table_Mapping tm ON cdm.PayorName = tm.PayorName AND cdm.IncomingColumnName IS NOT NULL
+            WHERE tm.TargetTable = @TargetTable";
 
-                // Set parameters to NULL
-                cmd.Parameters.AddWithValue("@DateStarting", DBNull.Value);
-                cmd.Parameters.AddWithValue("@DateEnding", DBNull.Value);
-                cmd.Parameters.AddWithValue("@CustomParameter1", DBNull.Value);
-                cmd.Parameters.AddWithValue("@CustomParameter2", DBNull.Value);
-                cmd.Parameters.AddWithValue("@DEBUG_FLAG", DBNull.Value);
-                var logIdParam = new SqlParameter("@LOG_ID", SqlDbType.Int) { Direction = ParameterDirection.Output };
-                cmd.Parameters.Add(logIdParam);
+     using (SqlCommand cmd = new SqlCommand(sql, conn))
+     {
+         cmd.Parameters.AddWithValue("@TargetTable", targetTable);
+         using (SqlDataReader rdr = cmd.ExecuteReader())
+         {
+             while (rdr.Read())
+             {
+                 list.Add(new ColumnMapping
+                 {
+                     IncomingColumn = rdr["IncomingColumn"].ToString(),
+                     TargetColumn = rdr["TargetColumn"].ToString(),
+                     IsRequired = Convert.ToBoolean(rdr["IsRequired"]),
+                     DataType = rdr["DataType"].ToString()
+                 });
+             }
+         }
+     }
 
-                // Add return value parameter
-                var returnCodeParam = new SqlParameter("@RC", SqlDbType.Int)
-                {
-                    Direction = ParameterDirection.ReturnValue
-                };
-                cmd.Parameters.Add(returnCodeParam);
+     return list;
+ }
 
-                Console.WriteLine($"Executing stored procedure: {storedProcName}");
-                var procStopwatch = Stopwatch.StartNew();
+ public void ProcessFiles(SqlConnection conn, TableMapping mapping, List<ColumnMapping> colMappings, string basePath)
+ {
+     string fullSourcePath = Path.Combine(basePath, mapping.SourcePath);
+     string[] files = Directory.GetFiles(fullSourcePath, mapping.FilePattern);
+     foreach (string file in files)
+     {
+         try
+         {
+             DataTable data;
 
-                //// Execute the stored procedure
-                //cmd.ExecuteNonQuery();
+             if (mapping.FileType.ToLower().Contains("excel"))
+             {
+                 data = ReadExcel(file, mapping, colMappings, conn.ConnectionString);
+             }
+             else
+             {
+                 data = ReadCsv(file, mapping.Delimiter, colMappings, conn.ConnectionString);
+             }
 
-                //// Retrieve the return code
-                //int returnCode = (int)returnCodeParam.Value;
-                //int logId = logIdParam.Value != DBNull.Value ? (int)logIdParam.Value : 0;
+             MapColumns(data, colMappings, conn.ConnectionString);
+             ApplyDataTypeConversions(data, colMappings);
+             LogTruncationIssues(data, mapping.TargetTable, conn);
+             TruncateTargetTable(mapping.TargetTable, conn);
+             BulkInsert(data, mapping.TargetTable, conn);
+             //RunPostLoadProcedure(conn, mapping.PostLoadProcedure);
+             
+             string fullArchivePath = Path.Combine(basePath, mapping.ArchivePath);
+             //ArchiveFile(file, fullArchivePath);
 
-                //// Check return code
-                //if (returnCode != 0)
-                //{
-                //    Console.WriteLine($"Stored procedure {storedProcName} failed with return code {returnCode}.");
-                //    Logger.LogExecution(conn, storedProcName, "Failure", $"Stored procedure returned {returnCode}", bytesWritten, fileCounter, 0);
+             //Log(conn.ConnectionString, $"? Processed and archived: {file}");
+         }
+         catch (Exception ex)
+         {
+             LogError(conn.ConnectionString, $"? Processing error: {file}", ex.Message);
+         }
+     }
+ }
+
+ private DataTable ReadCsv(string filePath, string delimiter, List<ColumnMapping> colMappings, string connStr)
+ {
+     DataTable dt = new DataTable();
+     string sourceFileName = Path.GetFileName(filePath);
+
+     using (StreamReader sr = new StreamReader(filePath))
+     {
+         string headerLine = sr.ReadLine();
+         if (headerLine == null) throw new Exception("CSV file is empty.");
+
+         bool isQuotedSingleColumn = !headerLine.Contains(delimiter) && headerLine.StartsWith("\"") && headerLine.EndsWith("\"");
+
+         if (isQuotedSingleColumn)
+         {
+             string header = headerLine.Trim().Trim('"');
+             dt.Columns.Add(header);
+             dt.Columns.Add("SourceFileName");
+
+             while (!sr.EndOfStream)
+             {
+                 string line = sr.ReadLine()?.Trim().Trim('"');
+                 if (!string.IsNullOrWhiteSpace(line))
+                 {
+                     DataRow row = dt.NewRow();
+                     row[header] = line;
+                     row["SourceFileName"] = sourceFileName;
+                     dt.Rows.Add(row);
+                 }
+             }
+         }
+         else
+         {
+             string[] headers = headerLine.Split(delimiter.ToCharArray());
+             foreach (string header in headers)
+                 dt.Columns.Add(header.Trim('"'));
+
+             dt.Columns.Add("SourceFileName");
+
+             // ✅ Moved outside the loop
+             ValidateRequiredColumns(dt, colMappings, "CSV", filePath);
+
+             while (!sr.EndOfStream)
+             {
+                 string[] values = sr.ReadLine()?.Split(delimiter.ToCharArray());
+                 if (values != null && values.Any(v => !string.IsNullOrWhiteSpace(v)))
+                 {
+                     if (values.Length > headers.Length)
+                     {
+                         LogError(connStr, "CSV Format Warning", $"Too many values in line of {sourceFileName}, Truncating extras.");
+                     }
+
+                     DataRow row = dt.NewRow();
+                     for (int i = 0; i < headers.Length; i++)
+                     {
+                         if (i < values.Length)
+                         {
+                             string val = values[i]?.Trim('"').Trim();
+                             row[i] = string.IsNullOrEmpty(val) ? (object)DBNull.Value : val;
+                         }
+                         else
+                         {
+                             row[i] = DBNull.Value;
+                         }
+                     }
+                     row["SourceFileName"] = sourceFileName;
+                     dt.Rows.Add(row);
+                 }
+             }
+         }
+     }
+
+     CleanDataTable(dt, filePath);
+
+     return dt;
+ }
+
+ private DataTable ReadExcel(string filePath, TableMapping mapping, List<ColumnMapping> colMappings, string connStr)
+ {
+     DataTable dt = new DataTable();
+     string ext = Path.GetExtension(filePath).ToLower();
+     //string hdr = "No";
+     string sheet = mapping.SheetName?.TrimEnd('$') + "$";
+     string hdrRowIndex = mapping.HeaderRowIndex.ToString();
+
+     string excelVersion = ext == ".xls" ? "Excel 8.0" : "Excel 12.0 Xml";
+     string connStrExcel = $"Provider=Microsoft.ACE.OLEDB.12.0;Data Source={filePath};" +
+                           $"Extended Properties=\"{excelVersion};HDR=No;IMEX=1\"";
+
+     try
+     {
+         using (OleDbConnection excelConn = new OleDbConnection(connStrExcel))
+         {
+             excelConn.Open();
+
+             // Optional: Validate sheet exists
+             DataTable sheets = excelConn.GetOleDbSchemaTable(OleDbSchemaGuid.Tables, null);
+             foreach (DataRow row in sheets.Rows)
+             {
+                 string sheetName = row["TABLE_NAME"].ToString();
+                 Logger.Log(connStr, $"Found sheet: {sheetName}");
+             }
+
+             string expectedSheet = mapping.SheetName.TrimEnd('$') + "$";
+
+             // Try to match ignoring quotes and casing
+             string matchedSheetName = sheets.AsEnumerable()
+                 .Select(r => r["TABLE_NAME"].ToString().Trim('\''))
+                 .FirstOrDefault(name => name.Equals(expectedSheet, StringComparison.OrdinalIgnoreCase));
+
+             if (matchedSheetName == null)
+             {
+                 LogError(connStr, "Excel Sheet Error", $"Sheet '{expectedSheet}' not found in file: {Path.GetFileName(filePath)}. Available sheets: " +
+                     string.Join(", ", sheets.AsEnumerable().Select(r => r["TABLE_NAME"].ToString())));
+                 throw new Exception($"Sheet '{expectedSheet}' not found.");
+             }
+
+             string query = $"SELECT * FROM [{matchedSheetName}]";
+
+             using (OleDbDataAdapter da = new OleDbDataAdapter(query, excelConn))
+             {
+                 da.Fill(dt);
+             }
+
+             // Promote the header row
+             int headerIndex = mapping.HeaderRowIndex - 1;
+             if (dt.Rows.Count <= headerIndex)
+                 throw new Exception($"HeaderRowIndex {mapping.HeaderRowIndex} exceeds total rows in Excel sheet.");
+
+             DataRow headerRow = dt.Rows[headerIndex];
+             for (int i = 0; i < dt.Columns.Count; i++)
+             {
+                 var rawHeader = headerRow[i]?.ToString()?.Trim();
+                 if (string.IsNullOrWhiteSpace(rawHeader))
+                     rawHeader = $"Column{i + 1}";
+                 dt.Columns[i].ColumnName = rawHeader;
+             }
+
+             // Remove header row only (don't delete it twice)
+             dt.Rows.RemoveAt(headerIndex);
+
+             // If you need to remove rows before header (rarely needed, be careful) - BRING IT BACK 
+             if (headerIndex > 0)
+             {
+                 for (int i = 0; i < headerIndex; i++)
+                 {
+                     if (dt.Rows.Count > 0)
+                         dt.Rows.RemoveAt(0);
+                 }
+             }
+
+             foreach (DataRow row in dt.Rows)
+             {
+                 foreach (DataColumn col in dt.Columns)
+                 {
+                     if (row[col] != null && string.IsNullOrWhiteSpace(row[col].ToString()))
+                         row[col] = DBNull.Value;
+                 }
+             }
+
+             dt.AcceptChanges();
+
+             CleanDataTable(dt, filePath);
+
+             // Validate required columns (optional)
+             ValidateRequiredColumns(dt, colMappings, "Excel", filePath);
+         }
+     }
+     catch (Exception ex)
+     {
+         LogError(connStr, "Excel Read Error", $"Failed to load Excel file: {filePath}. {ex.Message}");
+         throw;
+     }
+
+     return dt;
+ }
+
+ private void CleanDataTable(DataTable dt, string filePath)
+ {
+     RemoveEmptyRows(dt);
+
+     if (!dt.Columns.Contains("SourceFileName"))
+         dt.Columns.Add("SourceFileName", typeof(string));
+
+     foreach (DataRow row in dt.Rows)
+     {
+         foreach (DataColumn col in dt.Columns)
+         {
+             // Convert blank strings to NULLs
+             if (row[col] != null && string.IsNullOrWhiteSpace(row[col].ToString()))
+                 row[col] = DBNull.Value;
+         }
+
+         // Always set SourceFileName
+         row["SourceFileName"] = Path.GetFileName(filePath);
+     }
+ }
+
+ public void ApplyDataTypeConversions(DataTable dt, List<ColumnMapping> colMappings)
+ {
+     foreach (var map in colMappings)
+     {
+         if (string.IsNullOrWhiteSpace(map.DataType)) continue;
+         string colName = map.TargetColumn;
+
+         if (!dt.Columns.Contains(colName)) continue;
+
+         foreach (DataRow row in dt.Rows)
+         {
+             object value = row[colName];
+
+             if (value == null || value == DBNull.Value) continue;
+
+             string strValue = value.ToString().Trim();
+
+             try
+             {
+                 switch (map.DataType.ToLower())
+                 {
+                     case "date":
+                     case "datetime":
+                         if (DateTime.TryParse(strValue, out DateTime parsedDate))
+                         {
+                             row[colName] = parsedDate.ToString("yyyy-MM-dd");
+                         }
+                         else if (double.TryParse(strValue, out double serialVal))
+                         {
+                             DateTime convertedDate = DateTime.FromOADate(serialVal);
+                             row[colName] = convertedDate.ToString("yyyy-MM-dd");
+                         }
+                         break;
+
+                     case "int":
+                     case "integer":
+                         if (int.TryParse(strValue, out int intVal))
+                             row[colName] = intVal;
+                         else
+                             row[colName] = DBNull.Value;
+                         break;
+
+                     case "decimal":
+                     case "float":
+                     case "double":
+                         if (double.TryParse(strValue, out double dblVal))
+                             row[colName] = dblVal;
+                         else
+                             row[colName] = DBNull.Value;
+                         break;
+
+                     case "string":
+                     case "varchar":
+                         // No conversion needed
+                         break;
+
+                     default:
+                         // Unknown or unsupported type
+                         break;
+                 }
+             }
+             catch (Exception ex)
+             {
+                 LogError("...", $"Conversion failed for {colName}", ex.Message);
+             }
+         }
+     }
+ }
+
+ private void ValidateRequiredColumns(DataTable dt, List<ColumnMapping> colMappings, string fileType, string filePath)
+ {
+     // Step 1: Get all required target columns
+     var requiredTargets = colMappings
+         .Where(m => m.IsRequired)
+         .Select(m => m.TargetColumn)
+         .Distinct(StringComparer.OrdinalIgnoreCase)
+         .ToList();
+
+     foreach (var requiredTarget in requiredTargets)
+     {
+         // Step 2: Get all possible source columns that map to this target
+         var incomingAliases = colMappings
+             .Where(m => string.Equals(m.TargetColumn, requiredTarget, StringComparison.OrdinalIgnoreCase))
+             .Select(m => m.IncomingColumn)
+             .ToList();
+
+         // Step 3: Check if at least one of these aliases is present in the actual file
+         bool found = incomingAliases.Any(alias =>
+             dt.Columns.Contains(alias));
+
+         if (!found)
+         {
+             throw new Exception($"Missing required column mapping for target '{requiredTarget}' in {fileType} file: {filePath}");
+         }
+     }
+ }
+
+ private void RemoveEmptyRows(DataTable dt)
+ {
+     if (dt.Rows.Count > 0)
+     {
+         var nonEmptyRows = dt.AsEnumerable()
+             .Where(row => row.ItemArray.Any(cell =>
+                 cell != null && !string.IsNullOrWhiteSpace(cell.ToString())));
+
+         dt = nonEmptyRows.Any() ? nonEmptyRows.CopyToDataTable() : dt.Clone();
+     }
+ }
+
+ private void AddSourceFileNameColumn(DataTable dt, string filePath)
+ {
+     if (!dt.Columns.Contains("SourceFileName"))
+         dt.Columns.Add("SourceFileName", typeof(string));
+     foreach (DataRow row in dt.Rows)
+         row["SourceFileName"] = Path.GetFileName(filePath);
+ }
+
+ public void MapColumns(DataTable dt, List<ColumnMapping> mappings, string connStr)
+ {
+     //foreach (var map in mappings)
+     //{
+     //    if (dt.Columns.Contains(map.IncomingColumn))
+     //        dt.Columns[map.IncomingColumn].ColumnName = map.TargetColumn;
+     //}
+
+     foreach (var map in mappings)
+     {
+         if (dt.Columns.Contains(map.IncomingColumn))
+         {
+             string newName = map.TargetColumn;
+
+             if (dt.Columns.Contains(newName) && map.IncomingColumn != newName)
+             {
+                 // Log conflict and skip or rename with suffix
+                 LogError(connStr, "Column Rename Conflict",
+                     $"Target column '{newName}', already exists. Skipping rename from '{map.IncomingColumn}'.");
+                 continue;
+             }
+
+             dt.Columns[map.IncomingColumn].ColumnName = newName;
+         }
+     }
+ }
+
+ private void TruncateTargetTable(string tableName, SqlConnection conn)
+ {
+     using (SqlCommand cmd = new SqlCommand($"TRUNCATE TABLE {tableName}", conn))
+         cmd.ExecuteNonQuery();
+ }
+
+ public void LogSchemaDifferences(DataTable dt, string tableName, string sourceFileName, SqlConnection conn)
+ {
+     var destColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+     using (SqlCommand cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName}", conn))
+     using (SqlDataReader reader = cmd.ExecuteReader())
+         for (int i = 0; i < reader.FieldCount; i++)
+             destColumns.Add(reader.GetName(i));
+
+     foreach (DataColumn col in dt.Columns)
+     {
+         bool existsInDb = destColumns.Contains(col.ColumnName);
+         string alterStmt = existsInDb ? null : $"ALTER TABLE {tableName} ADD [{col.ColumnName}] NVARCHAR(255);";
+
+         using (SqlCommand logCmd = new SqlCommand("ETL.usp_Log_Claim_File_Schema_History", conn))
+         {
+             logCmd.CommandType = CommandType.StoredProcedure;
+             logCmd.Parameters.AddWithValue("@TableName", tableName);
+             logCmd.Parameters.AddWithValue("@ColumnName", col.ColumnName);
+             logCmd.Parameters.AddWithValue("@ColumnDetected", 1);
+             logCmd.Parameters.AddWithValue("@ColumnMapped", existsInDb ? 1 : 0);
+             logCmd.Parameters.AddWithValue("@SuggestedAlterStatement", (object)alterStmt ?? DBNull.Value);
+             logCmd.Parameters.AddWithValue("@SourceFileName", sourceFileName);
+             logCmd.ExecuteNonQuery();
+         }
+     }
+ }
+
+ public void LogTruncationIssues(DataTable dt, string tableName, SqlConnection conn)
+ {
+     // Get destination column limits from database
+     var colLengths = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+     using (SqlCommand cmd = new SqlCommand($@"
+         SELECT COLUMN_NAME, CHARACTER_MAXIMUM_LENGTH
+         FROM INFORMATION_SCHEMA.COLUMNS
+         WHERE TABLE_NAME = @TableName AND CHARACTER_MAXIMUM_LENGTH IS NOT NULL", conn))
+     {
+         cmd.Parameters.AddWithValue("@TableName", tableName);
+         using (SqlDataReader reader = cmd.ExecuteReader())
+         {
+             while (reader.Read())
+             {
+                 string colName = reader.GetString(0);
+                 int maxLength = reader.IsDBNull(1) ? 0 : reader.GetInt32(1);
+                 colLengths[colName] = maxLength;
+             }
+         }
+     }
+
+     // Check each row
+     foreach (DataRow row in dt.Rows)
+     {
+         foreach (DataColumn col in dt.Columns)
+         {
+             if (col.DataType != typeof(string)) continue;
+
+             if (!colLengths.TryGetValue(col.ColumnName, out int maxAllowed)) continue;
+
+             string value = row[col]?.ToString();
+             if (string.IsNullOrEmpty(value)) continue;
+
+             if (value.Length > maxAllowed)
+             {
+                 // Create a row identifier if needed
+                 string rowId = row.Table.Columns.Contains("SourceFileName") ? row["SourceFileName"].ToString() : "UnknownFile";
+
+                 using (SqlCommand logCmd = new SqlCommand(@"
+                     INSERT INTO ETL.Truncation_Log 
+                     (TableName, ColumnName, RowIdentifier, ActualLength, MaxAllowedLength, ValueTruncated) 
+                     VALUES (@TableName, @ColumnName, @RowIdentifier, @ActualLength, @MaxAllowedLength, @ValueTruncated)", conn))
+                 {
+                     logCmd.Parameters.AddWithValue("@TableName", tableName);
+                     logCmd.Parameters.AddWithValue("@ColumnName", col.ColumnName);
+                     logCmd.Parameters.AddWithValue("@RowIdentifier", rowId);
+                     logCmd.Parameters.AddWithValue("@ActualLength", value.Length);
+                     logCmd.Parameters.AddWithValue("@MaxAllowedLength", maxAllowed);
+                     logCmd.Parameters.AddWithValue("@ValueTruncated", value.Substring(0, Math.Min(255, value.Length))); // Just a preview
+
+                     logCmd.ExecuteNonQuery();
+                 }
+             }
+         }
+     }
+ }
+
+ public void BulkInsert(DataTable dt, string tableName, SqlConnection conn)
+ {
+     LogSchemaDifferences(dt, tableName, dt.Rows[0]["SourceFileName"].ToString(), conn);
+
+     var destColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+     using (SqlCommand cmd = new SqlCommand($"SELECT TOP 0 * FROM {tableName}", conn))
+     using (SqlDataReader reader = cmd.ExecuteReader())
+         for (int i = 0; i < reader.FieldCount; i++)
+             destColumns.Add(reader.GetName(i));
+
+     using (SqlBulkCopy bulk = new SqlBulkCopy(conn))
+     {
+         bulk.BulkCopyTimeout = 300; // Seconds
+         bulk.DestinationTableName = tableName;
+         foreach (DataColumn col in dt.Columns)
+         {
+             if (destColumns.Contains(col.ColumnName))
+                 bulk.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+         }
+         bulk.WriteToServer(dt);
+     }
+ }
+
+ public void SendSummaryEmail(string connStr, string mappingIdList, string smtpServer)
+ {
+     foreach (string id in mappingIdList.Split(','))
+     {
+         if (int.TryParse(id.Trim(), out int mappingId))
+         {
+             try
+             {
+                 string recipient = string.Empty;
+                 string sender = string.Empty;
+                 string subject = string.Empty;
+                 string body = string.Empty;
+
+                 using (SqlConnection conn = new SqlConnection(connStr))
+                 using (SqlCommand cmd = new SqlCommand("ETL.usp_Build_Email_Summary", conn))
+                 {
+                     cmd.CommandType = CommandType.StoredProcedure;
+                     cmd.Parameters.AddWithValue("@MappingId", mappingId);
+
+                     SqlParameter recipientParam = new SqlParameter("@Recipient", SqlDbType.NVarChar, 255)
+                     {
+                         Direction = ParameterDirection.Output
+                     };
+                     SqlParameter senderParam = new SqlParameter("@Sender", SqlDbType.NVarChar, 255)
+                     {
+                         Direction = ParameterDirection.Output
+                     };
+                     SqlParameter subjectParam = new SqlParameter("@Subject", SqlDbType.NVarChar, 255)
+                     {
+                         Direction = ParameterDirection.Output
+                     };
+                     SqlParameter bodyParam = new SqlParameter("@Body", SqlDbType.NVarChar, -1)
+                     {
+                         Direction = ParameterDirection.Output
+                     };
+
+                     cmd.Parameters.Add(recipientParam);
+                     cmd.Parameters.Add(senderParam);
+                     cmd.Parameters.Add(subjectParam);
+                     cmd.Parameters.Add(bodyParam);
+
+                     conn.Open();
+                     cmd.ExecuteNonQuery();
+
+                     recipient = recipientParam.Value?.ToString();
+                     sender = senderParam.Value?.ToString(); 
+                     subject = subjectParam.Value?.ToString();
+                     body = bodyParam.Value?.ToString();
+                 }
+
+                 SendEmail(recipient, sender, subject, body, smtpServer, connStr);
+             }
+             catch (Exception ex)
+             {
+                 LogError(connStr, $"Email Error for MappingId {mappingId}", ex.Message);
+             }
+         }
+     }
+ }
 
 
-                //    return; // Stop further execution
-                //}
+ public void SendEmail(string recipientList, string sender, string subject, string body, string smtpServer, string connStr)
+ {
+     try
+     {
+         using (System.Net.Mail.SmtpClient smtp = new System.Net.Mail.SmtpClient(smtpServer))
+         {
+             smtp.UseDefaultCredentials = true;
+             smtp.EnableSsl = true;
 
-                // If return code is 0, proceed with exporting data
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (reader.HasRows) // If the procedure returns data, process it
-                    {
-                        while (reader.Read())
-                        {
-                            if (!headerWritten)
-                            {
-                                WriteHeader(reader, buffer);
-                                bytesWritten += Encoding.UTF8.GetByteCount(buffer.ToString());
-                                headerWritten = true;
-                            }
+             var message = new System.Net.Mail.MailMessage();
+             message.From = new MailAddress(sender);
+             message.Subject = subject;
+             message.Body = body;
 
-                            string row = FormatRow(reader);
-                            bytesWritten += Encoding.UTF8.GetByteCount(row + Environment.NewLine);
-                            buffer.AppendLine(row);
-                            hasData = true; // Mark that data was found
+             foreach (string addr in recipientList.Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries))
+             {
+                 message.To.Add(new MailAddress(addr.Trim()));
+             }
 
-                            if (bytesWritten >= maxFileLength)
-                            {
-                                FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter++);
-                                bytesWritten = 0;
-                                headerWritten = false;
-                            }
-                        }
-                    }
-
-                    // If no data was found but columns exist, output only the headers
-                    if (!hasData && reader.FieldCount > 0)
-                    {
-                        WriteHeader(reader, buffer);
-                        FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
-                    }
-
-                    if (buffer.Length > 0)
-                    {
-                        FlushBuffer(buffer, folderPath, fileNameTemplate, fileCounter);
-                    }
-                }
-                // Retrieve the return code
-                int returnCode = (int)returnCodeParam.Value;
-                int logId = logIdParam.Value != DBNull.Value ? (int)logIdParam.Value : 0;
-
-                // Check return code
-                if (returnCode != 0)
-                {
-                    Console.WriteLine($"Stored procedure {storedProcName} failed with return code {returnCode}.");
-                    Logger.LogExecution(conn, storedProcName, "Failure", $"Stored procedure returned {returnCode}", bytesWritten, fileCounter, 0);
+             smtp.Send(message);
+         }
+     }
+     catch (Exception ex)
+     {
+         LogError(connStr, "SMTP Send Error", ex.Message);
+     }
+ }
 
 
-                    return; // Stop further execution
-                }
-                
-                Logger.LogExecution(conn, storedProcName, "Success", "Success", bytesWritten, fileCounter, procStopwatch.ElapsedMilliseconds, logId: logIdParam.Value != DBNull.Value ? (int)logIdParam.Value: 0);
-            }
-        }
-        catch (Exception ex)
-        {
-            Logger.LogExecution(conn, storedProcName, "Failure", ex.Message, bytesWritten, fileCounter, 0, ex.StackTrace);
-            throw;
-        }
-    }
+ public void RunPostLoadProcedure(SqlConnection conn, string procedureName)
+ {
+     if (string.IsNullOrWhiteSpace(procedureName))
+         return;
 
-    internal static void WriteHeader(SqlDataReader reader, StringBuilder buffer)
-    {
-        for (int i = 0; i < reader.FieldCount; i++)
-        {
-            if (i > 0) buffer.Append("|");
-            buffer.Append(reader.GetName(i));
-        }
-        buffer.AppendLine();
-    }
+     try
+     {
+         using (SqlCommand cmd = new SqlCommand(procedureName, conn))
+         {
+             cmd.CommandType = CommandType.StoredProcedure;
+             cmd.ExecuteNonQuery();
+         }
 
-    internal static string FormatRow(SqlDataReader reader)
-    {
-        var row = new StringBuilder();
-        for (int i = 0; i < reader.FieldCount; i++)
-        {
-            if (i > 0) row.Append("|");
-            string value = reader.IsDBNull(i) ? string.Empty : reader.GetValue(i).ToString().Replace("\"", "'");
-            row.Append($"\"{value}\"");
-        }
-        return row.ToString();
-    }
+         Logger.Log(conn.ConnectionString, $"Post-load procedure executed: {procedureName}");
+     }
+     catch (Exception ex)
+     {
+         LogError(conn.ConnectionString, $"Failed to execute post-load proc: {procedureName}", ex.Message);
+     }
+ }
 
-    internal static void FlushBuffer(StringBuilder buffer, string folderPath, string fileNameTemplate, int fileCounter)
-    {
-        string fileName = fileNameTemplate
-            .Replace("{YYYYMMDD}", DateTime.Now.ToString("yyyyMMdd"))
-            .Replace("{0}", fileCounter.ToString());
+ public void ArchiveFile(string filePath, string archivePath)
+ {
+     string yearMonth = DateTime.Now.ToString("yyyyMM");
+     string subfolder = Path.Combine(archivePath, yearMonth);
 
-        string filePath = Path.Combine(folderPath, fileName);
+     if (!Directory.Exists(subfolder))
+         Directory.CreateDirectory(subfolder);
 
-        using (var writer = new StreamWriter(filePath, false, Encoding.UTF8, 8192))
-        {
-            writer.Write(buffer);
-            buffer.Clear();
-        }
+     string destPath = Path.Combine(subfolder, Path.GetFileName(filePath));
+     File.Move(filePath, destPath);
+ }
 
-    }
-}
+ public static class Logger
+ {
+     public static void Log(string connStr, string message)
+     {
+         using (SqlConnection conn = new SqlConnection(connStr))
+         {
+             conn.Open();
+             using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL.Claims_Log (LogTimestamp, Message) VALUES (@ts, @msg)", conn))
+             {
+                 cmd.Parameters.AddWithValue("@ts", DateTime.Now);
+                 cmd.Parameters.AddWithValue("@msg", message);
+                 cmd.ExecuteNonQuery();
+             }
+         }
+     }
+ }
 
-// TaskRunner.cs
-internal static class TaskRunner
-{
-    internal static async System.Threading.Tasks.Task RunTaskAsync(SemaphoreSlim semaphore, string connString, StoredProcConfig config, string folderPath)
-    {
-        await semaphore.WaitAsync();
-        try
-        {
-            RetryTask(() => ExecuteTask(connString, config, folderPath), 3, config.WaitTimeMinutes);
-        }
-        finally
-        {
-            semaphore.Release();
-        }
-    }
-
-    internal static async void RetryTask(Action taskAction, int maxRetries, int waitTimeMinutes)
-    {
-        int attempts = 0;
-        while (attempts < maxRetries)
-        {
-            try
-            {
-                taskAction();
-                return; // Exit the loop if the task succeeds
-            }
-            catch (Exception ex)
-            {
-                attempts++;
-                //Add a LogRetryAttempt(attempts, ex.Message);
-                if (attempts >= maxRetries)
-                {
-                    throw new Exception($"Task failed after {maxRetries} attempts: {ex.Message}", ex);
-                }
-                // Wait before retrying async
-                await Task.Delay(TimeSpan.FromMinutes(waitTimeMinutes));
-            }
-        }
-    }
-
-    internal static void ExecuteTask(string connString, StoredProcConfig config, string folderPath)
-    {
-        try
-        {
-            using (var conn = SqlHelper.CreateConnection(connString))
-            {
-                StoredProcExecutor.ExecuteAndExport(
-                    conn,
-                    config.StoredProcName,
-                    folderPath,
-                    config.FileNameTemplate,
-                    config.MaxFileLength);
-            }
-        }
-        catch (Exception ex)
-        {
-            using (var conn = SqlHelper.CreateConnection(connString))
-            {
-                Logger.LogExecution(conn, config.StoredProcName, "Failure", ex.Message, stackTrace: ex.StackTrace);
-            }
-            throw; // Rethrow to enable retry logic
-        }
-    }
-}
+ public void LogError(string connStr, string errorType, string message)
+ {
+     using (SqlConnection conn = new SqlConnection(connStr))
+     {
+         conn.Open();
+         using (SqlCommand cmd = new SqlCommand("INSERT INTO ETL.Claims_Error_Log (LogTimestamp, Message) VALUES (@ts, @msg)", conn))
+         {
+             cmd.Parameters.AddWithValue("@ts", DateTime.Now);
+             cmd.Parameters.AddWithValue("@msg", $"{errorType}: {message}");;
+             cmd.ExecuteNonQuery();
+         }
+     }
+ }
