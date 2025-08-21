@@ -1,105 +1,85 @@
-// GetLogSummary.cs
-using System;
-using System.Data.SqlClient;
-using System.Text;
-using Microsoft.SqlServer.Dts.Runtime;
-
-public class GetLogSummary
+public static class GetLogSummary
 {
-    private readonly Variables _vars;
-
-    public GetLogSummary(Variables vars)
+    public static string GenerateHtmlSummary(string payerName, Variables vars)
     {
-        _vars = vars;
-    }
+        var connStr = vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+        var entries = new List<FileLogEntry>();
 
-    public string GenerateHtml(int mappingId)
-    {
-        var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-
-        var sb = new StringBuilder();
-        sb.AppendLine("<h3>File Processing Summary</h3>");
-
-        try
+        using (var conn = new SqlConnection(connStr))
         {
-            using (var conn = new SqlConnection(connStr))
+            conn.Open();
+
+            // Get the latest ProcessedAt timestamp for this PayerName
+            string latestTimeQuery = @"
+                SELECT MAX(ProcessedAt) 
+                FROM MoveIt.FileTransferLog
+                WHERE MappingID = (SELECT MappingID FROM MoveIt.EmailAddresses WHERE PayerName = @PayerName)";
+
+            DateTime? latestProcessedAt = null;
+            using (var cmd = new SqlCommand(latestTimeQuery, conn))
             {
-                conn.Open();
+                cmd.Parameters.AddWithValue("@PayerName", payerName);
+                var result = cmd.ExecuteScalar();
+                if (result != DBNull.Value && result != null)
+                    latestProcessedAt = (DateTime)result;
+            }
 
-                // Fetch all logs for this mapping ID
-                string query = @"SELECT FileName, ActionType, FileSize, Status, LogMessage, ProcessedAt
-                                 FROM MoveIt.FileTransferLog
-                                 WHERE MappingID = @MappingID
-                                 ORDER BY ProcessedAt ASC";
+            if (latestProcessedAt == null)
+                return "<p>No files processed for today.</p>";
 
-                using (var cmd = new SqlCommand(query, conn))
+            // Get all log records for that latest ProcessedAt timestamp
+            string logQuery = @"
+                SELECT FileName, ActionType, FileSize, Status, LogMessage 
+                FROM MoveIt.FileTransferLog
+                WHERE MappingID = (SELECT MappingID FROM MoveIt.EmailAddresses WHERE PayerName = @PayerName)
+                  AND ProcessedAt = @ProcessedAt
+                ORDER BY FileName";
+
+            using (var cmd = new SqlCommand(logQuery, conn))
+            {
+                cmd.Parameters.AddWithValue("@PayerName", payerName);
+                cmd.Parameters.AddWithValue("@ProcessedAt", latestProcessedAt.Value);
+
+                using (var reader = cmd.ExecuteReader())
                 {
-                    cmd.Parameters.AddWithValue("@MappingID", mappingId);
-
-                    using (var reader = cmd.ExecuteReader())
+                    while (reader.Read())
                     {
-                        if (!reader.HasRows)
+                        entries.Add(new FileLogEntry
                         {
-                            sb.AppendLine("<p>No files were processed.</p>");
-                            return sb.ToString();
-                        }
-
-                        // Table header
-                        sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse; width:100%; font-family:Arial, sans-serif;'>");
-                        sb.AppendLine("<tr style='background-color:#4CAF50; color:white;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th><th>Message</th><th>Processed At</th></tr>");
-
-                        bool alternate = false;
-
-                        while (reader.Read())
-                        {
-                            string bgColor = alternate ? "#f9f9f9" : "#ffffff";
-                            alternate = !alternate;
-
-                            sb.AppendLine($"<tr style='background-color:{bgColor};'>");
-                            sb.AppendLine($"<td>{reader["FileName"]}</td>");
-                            sb.AppendLine($"<td>{reader["ActionType"]}</td>");
-                            sb.AppendLine($"<td>{reader["FileSize"]}</td>");
-                            sb.AppendLine($"<td>{reader["Status"]}</td>");
-                            sb.AppendLine($"<td>{reader["LogMessage"]}</td>");
-                            sb.AppendLine($"<td>{Convert.ToDateTime(reader["ProcessedAt"]).ToString("yyyy-MM-dd HH:mm:ss")}</td>");
-                            sb.AppendLine("</tr>");
-                        }
-
-                        sb.AppendLine("</table>");
-
-                        // Summary counts
-                        sb.AppendLine("<br/>");
-                        sb.AppendLine("<h4>Summary Counts:</h4>");
-                        sb.AppendLine("<ul>");
-
-                        string countQuery = @"SELECT Status, COUNT(*) AS Count
-                                              FROM MoveIt.FileTransferLog
-                                              WHERE MappingID = @MappingID
-                                              GROUP BY Status";
-
-                        using (var countCmd = new SqlCommand(countQuery, conn))
-                        {
-                            countCmd.Parameters.AddWithValue("@MappingID", mappingId);
-                            using (var countReader = countCmd.ExecuteReader())
-                            {
-                                while (countReader.Read())
-                                {
-                                    sb.AppendLine($"<li>{countReader["Status"]}: {countReader["Count"]}</li>");
-                                }
-                            }
-                        }
-
-                        sb.AppendLine("</ul>");
+                            FileName = reader["FileName"].ToString(),
+                            Action = reader["ActionType"].ToString(),
+                            FileSize = Convert.ToInt64(reader["FileSize"]),
+                            Status = reader["Status"].ToString()
+                        });
                     }
                 }
             }
         }
-        catch (Exception ex)
+
+        // Generate HTML
+        if (entries.Count == 0)
+            return "<p>No files processed in the latest batch.</p>";
+
+        var sb = new StringBuilder();
+        sb.AppendLine("<h3>File Processing Summary</h3>");
+        sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>");
+        sb.AppendLine("<tr style='background-color:#f2f2f2;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th></tr>");
+
+        foreach (var entry in entries)
         {
-            sb.AppendLine($"<p style='color:red;'>Failed to generate log summary: {ex.Message}</p>");
+            sb.AppendLine($"<tr><td>{entry.FileName}</td><td>{entry.Action}</td><td>{entry.FileSize}</td><td>{entry.Status}</td></tr>");
         }
 
+        sb.AppendLine("</table>");
         return sb.ToString();
+    }
+
+    public class FileLogEntry
+    {
+        public string FileName { get; set; }
+        public string Action { get; set; }
+        public long FileSize { get; set; }
+        public string Status { get; set; }
     }
 }
 
@@ -111,19 +91,36 @@ public void Main()
 
     try
     {
+        // Load config from SSIS variables
         var config = Config.LoadFromVariables(Dts.Variables);
 
-        // Process files
-        var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables);
+        // Reset EmailSent to false at start of package run if needed
+        if (!Dts.Variables.Contains("User::EmailSent"))
+        {
+            Dts.Variables.Add("User::EmailSent", false);
+        }
+
+        // Execute file processing
+        var summary = new EmailSummary();
+        var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables, summary);
         processor.Execute();
 
-        // Generate summary email from log table
-        var summary = GetLogSummary(config.MappingID);
-        string htmlBody = summary.GenerateHtml();
+        // Check if email already sent
+        bool emailSent = (bool)Dts.Variables["User::EmailSent"].Value;
+        if (!emailSent)
+        {
+            // Generate HTML summary from FileTransferLog
+            string htmlBody = GetLogSummary.GenerateHtmlSummary(config.PayerName, Dts.Variables);
 
-        // Send summary email
-        var emailer = new Emailer(Dts.Variables);
-        emailer.SendEmail(smtpServer, "File Processing Summary", htmlBody, config.PayerName);
+            if (!string.IsNullOrWhiteSpace(htmlBody))
+            {
+                var emailer = new Emailer(Dts.Variables);
+                emailer.SendEmail(smtpServer, $"File Processing Summary - {config.PayerName}", htmlBody, config.PayerName);
+
+                // Mark as sent to prevent duplicate emails
+                Dts.Variables["User::EmailSent"].Value = true;
+            }
+        }
 
         Dts.TaskResult = (int)ScriptResults.Success;
     }
