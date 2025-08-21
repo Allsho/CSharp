@@ -1,89 +1,4 @@
-public static class GetLogSummary
-{
-    public static string GenerateHtmlSummary(string payerName, Variables vars)
-    {
-        var connStr = vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-        var entries = new List<FileLogEntry>();
-
-        using (var conn = new SqlConnection(connStr))
-        {
-            conn.Open();
-
-            // Get the latest ProcessedAt timestamp for this PayerName
-            string latestTimeQuery = @"
-                SELECT MAX(ProcessedAt) 
-                FROM MoveIt.FileTransferLog
-                WHERE MappingID = (SELECT MappingID FROM MoveIt.EmailAddresses WHERE PayerName = @PayerName)";
-
-            DateTime? latestProcessedAt = null;
-            using (var cmd = new SqlCommand(latestTimeQuery, conn))
-            {
-                cmd.Parameters.AddWithValue("@PayerName", payerName);
-                var result = cmd.ExecuteScalar();
-                if (result != DBNull.Value && result != null)
-                    latestProcessedAt = (DateTime)result;
-            }
-
-            if (latestProcessedAt == null)
-                return "<p>No files processed for today.</p>";
-
-            // Get all log records for that latest ProcessedAt timestamp
-            string logQuery = @"
-                SELECT FileName, ActionType, FileSize, Status, LogMessage 
-                FROM MoveIt.FileTransferLog
-                WHERE MappingID = (SELECT MappingID FROM MoveIt.EmailAddresses WHERE PayerName = @PayerName)
-                  AND ProcessedAt = @ProcessedAt
-                ORDER BY FileName";
-
-            using (var cmd = new SqlCommand(logQuery, conn))
-            {
-                cmd.Parameters.AddWithValue("@PayerName", payerName);
-                cmd.Parameters.AddWithValue("@ProcessedAt", latestProcessedAt.Value);
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        entries.Add(new FileLogEntry
-                        {
-                            FileName = reader["FileName"].ToString(),
-                            Action = reader["ActionType"].ToString(),
-                            FileSize = Convert.ToInt64(reader["FileSize"]),
-                            Status = reader["Status"].ToString()
-                        });
-                    }
-                }
-            }
-        }
-
-        // Generate HTML
-        if (entries.Count == 0)
-            return "<p>No files processed in the latest batch.</p>";
-
-        var sb = new StringBuilder();
-        sb.AppendLine("<h3>File Processing Summary</h3>");
-        sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>");
-        sb.AppendLine("<tr style='background-color:#f2f2f2;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th></tr>");
-
-        foreach (var entry in entries)
-        {
-            sb.AppendLine($"<tr><td>{entry.FileName}</td><td>{entry.Action}</td><td>{entry.FileSize}</td><td>{entry.Status}</td></tr>");
-        }
-
-        sb.AppendLine("</table>");
-        return sb.ToString();
-    }
-
-    public class FileLogEntry
-    {
-        public string FileName { get; set; }
-        public string Action { get; set; }
-        public long FileSize { get; set; }
-        public string Status { get; set; }
-    }
-}
-
-
+// Main.cs
 public void Main()
 {
     ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
@@ -91,35 +6,35 @@ public void Main()
 
     try
     {
-        // Load config from SSIS variables
         var config = Config.LoadFromVariables(Dts.Variables);
 
-        // Reset EmailSent to false at start of package run if needed
-        if (!Dts.Variables.Contains("User::EmailSent"))
+        // Only process files if there are any
+        if (config.HasFiles)
         {
-            Dts.Variables.Add("User::EmailSent", false);
+            var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables);
+            processor.Execute();
         }
 
-        // Execute file processing
-        var summary = new EmailSummary();
-        var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables, summary);
-        processor.Execute();
-
-        // Check if email already sent
-        bool emailSent = (bool)Dts.Variables["User::EmailSent"].Value;
-        if (!emailSent)
+        // Ensure email is only sent once per package execution
+        bool emailAlreadySent = false;
+        if (Dts.Variables.Contains("User::EmailSent") && Dts.Variables["User::EmailSent"].Value is bool sentFlag)
         {
-            // Generate HTML summary from FileTransferLog
-            string htmlBody = GetLogSummary.GenerateHtmlSummary(config.PayerName, Dts.Variables);
+            emailAlreadySent = sentFlag;
+        }
 
-            if (!string.IsNullOrWhiteSpace(htmlBody))
-            {
-                var emailer = new Emailer(Dts.Variables);
-                emailer.SendEmail(smtpServer, $"File Processing Summary - {config.PayerName}", htmlBody, config.PayerName);
+        if (!emailAlreadySent)
+        {
+            // Get a professional summary from the log table
+            var summaryHtml = GetLogSummary.GenerateHtmlSummary(config.PayerName, Dts.Variables);
 
-                // Mark as sent to prevent duplicate emails
+            var emailer = new Emailer(Dts.Variables);
+            emailer.SendEmail(smtpServer, "File Processing Summary", summaryHtml, config.PayerName);
+
+            // Mark that email has been sent
+            if (Dts.Variables.Contains("User::EmailSent"))
                 Dts.Variables["User::EmailSent"].Value = true;
-            }
+            else
+                Dts.Variables.Add("User::EmailSent", true);
         }
 
         Dts.TaskResult = (int)ScriptResults.Success;
