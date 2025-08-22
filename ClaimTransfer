@@ -1,39 +1,51 @@
-// Main.cs
-using System;
-using Microsoft.SqlServer.Dts.Runtime;
-
-public class ScriptMain
+public static string GenerateHtmlSummary(string payerName, Variables vars)
 {
-    public void Main()
+    var connStr = vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+    var sb = new StringBuilder();
+
+    using (var conn = new SqlConnection(connStr))
     {
-        ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
-        string smtpServer = smtpConnection.Properties["SmtpServer"].GetValue(smtpConnection).ToString();
+        conn.Open();
 
-        try
+        // Get the most recent processed time
+        string latestTimeQuery = @"SELECT MAX(ProcessedAt) 
+                                   FROM MoveIt.FileTransferLog
+                                   WHERE PayerName = @PayerName";
+        DateTime lastProcessedAt;
+        using (var cmd = new SqlCommand(latestTimeQuery, conn))
         {
-            // Load configuration from SSIS variables
-            var config = Config.LoadFromVariables(Dts.Variables);
-
-            // Process files
-            var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables, null);
-            processor.Execute();
-
-            // Generate professional log summary directly from database
-            var logSummary = new GetLogSummary(Dts.Variables);
-            string htmlBody = logSummary.GenerateHtml(config.MappingID);
-
-            // Send summary email
-            var emailer = new Emailer(Dts.Variables);
-            emailer.SendEmail(smtpServer, "File Processing Summary", htmlBody, config.PayerName);
-
-            Dts.TaskResult = (int)ScriptResults.Success;
-            Console.WriteLine("Main execution completed successfully.");
+            cmd.Parameters.AddWithValue("@PayerName", payerName);
+            var result = cmd.ExecuteScalar();
+            lastProcessedAt = result != DBNull.Value ? Convert.ToDateTime(result) : DateTime.MinValue;
         }
-        catch (Exception ex)
+
+        // Pull only records after the latest processed time
+        string query = @"SELECT FileName, ActionType, FileSize, Status, ProcessedAt
+                         FROM MoveIt.FileTransferLog
+                         WHERE PayerName = @PayerName
+                           AND ProcessedAt > @LastProcessedAt
+                         ORDER BY ProcessedAt ASC";
+
+        using (var cmd = new SqlCommand(query, conn))
         {
-            Console.WriteLine($"Error in Main(): {ex.Message}");
-            new Logger(Dts.Variables).LogError("Main", ex.Message);
-            Dts.TaskResult = (int)ScriptResults.Failure;
+            cmd.Parameters.AddWithValue("@PayerName", payerName);
+            cmd.Parameters.AddWithValue("@LastProcessedAt", lastProcessedAt);
+
+            using (var reader = cmd.ExecuteReader())
+            {
+                sb.AppendLine("<h3>File Processing Summary</h3>");
+                sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>");
+                sb.AppendLine("<tr style='background-color:#f2f2f2;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th><th>ProcessedAt</th></tr>");
+
+                while (reader.Read())
+                {
+                    sb.AppendLine($"<tr><td>{reader["FileName"]}</td><td>{reader["ActionType"]}</td><td>{reader["FileSize"]}</td><td>{reader["Status"]}</td><td>{reader["ProcessedAt"]}</td></tr>");
+                }
+
+                sb.AppendLine("</table>");
+            }
         }
     }
+
+    return sb.ToString();
 }
