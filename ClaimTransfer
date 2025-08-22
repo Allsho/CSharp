@@ -1,541 +1,84 @@
-// Main
-public void Main()
-{
-    ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
-    string smtpServer = smtpConnection.Properties["SmtpServer"].GetValue(smtpConnection).ToString();
-
-    try
-    {
-        var config = Config.LoadFromVariables(Dts.Variables);
-
-        // Only process files if there are any
-        if (config.HasFiles)
-        {
-            var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables);
-            processor.Execute();
-        }
-
-        // Ensure email is only sent once per package execution
-        bool emailAlreadySent = false;
-        if (Dts.Variables.Contains("User::EmailSent") && Dts.Variables["User::EmailSent"].Value is bool sentFlag)
-        {
-            emailAlreadySent = sentFlag;
-        }
-
-        if (!emailAlreadySent)
-        {
-            // Get a professional summary from the log table
-            var summaryHtml = GetLogSummary.GenerateHtmlSummary(config.PayerName, Dts.Variables);
-
-            var emailer = new Emailer(Dts.Variables);
-            emailer.SendEmail(smtpServer, "File Processing Summary", summaryHtml, config.PayerName);
-
-            // Mark that email has been sent
-            if (Dts.Variables.Contains("User::EmailSent"))
-                Dts.Variables["User::EmailSent"].Value = true;
-        }
-
-        Dts.TaskResult = (int)ScriptResults.Success;
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error in Main(): {ex.Message}");
-        new Logger(Dts.Variables).LogError("Main", ex.Message);
-        Dts.TaskResult = (int)ScriptResults.Failure;
-    }
-}
-
-// Config.cs
-    public class Config
-    {
-        public int MappingID;
-        public string ActionType;
-        public string SourceFolder;
-        public string DestinationFolder;
-        public string FilePattern;
-        public string ExclusionList;
-        public string ZipName;
-        public string PayerName;
-        public int Sequence;
-        public string CurrentPayer;
-        public bool HasFiles;
-        public string ArchiveFolder;
-
-        public static Config LoadFromVariables(Variables vars)
-        {
-            return new Config
-            {
-                MappingID = Convert.ToInt32(vars["User::MappingID"].Value),
-                ActionType = vars["User::ActionType"].Value.ToString(),
-                SourceFolder = vars["User::SourceFolder"].Value.ToString(),
-                DestinationFolder = vars["User::DestinationFolder"].Value.ToString(),
-                FilePattern = vars["User::FilePattern"].Value.ToString(),
-                ExclusionList = vars["User::ExclusionList"].Value.ToString(),
-                ZipName = vars["User::ZipName"].Value.ToString(),
-                PayerName = vars["User::PayerName"].Value.ToString(),
-                Sequence = Convert.ToInt32(vars["User::Sequence"].Value),
-                CurrentPayer = vars["User::CurrentPayer"].Value.ToString(),
-                HasFiles = (bool)vars["User::HasFiles"].Value,
-                ArchiveFolder = vars["User::ArchiveFolder"].Value.ToString()
-            };
-        }
-    }
-
-//Emailer.cs
-public class Emailer
-{
-    private readonly Variables _vars;
-
-    public Emailer(Variables vars)
-    {
-        _vars = vars;
-    }
-
-    public void SendEmail(string smtpServer, string subject, string htmlBody, string payerName)
-    {
-        try
-        {
-            // Fetch Sender and Recipients from MoveIt.EmailAddresses
-            var emailAddresses = GetEmailAddressesFromDb(payerName);
-
-            if (string.IsNullOrWhiteSpace(emailAddresses.Sender) || string.IsNullOrWhiteSpace(emailAddresses.Recipients))
-            {
-                Console.WriteLine("Sender or Recipients missing. Email not sent.");
-                return;
-            }
-
-            using (var message = new MailMessage())
-            {
-                message.From = new MailAddress(emailAddresses.Sender);
-
-                // Add multiple recipients (comma-separated)
-                foreach (var recipient in emailAddresses.Recipients.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    message.To.Add(recipient.Trim());
-                }
-
-                message.Subject = subject;
-                message.Body = htmlBody;
-                message.IsBodyHtml = true;
-
-                using (var client = new SmtpClient(smtpServer))
-                {
-                    client.UseDefaultCredentials = true;
-
-                    try
-                    {
-                        client.Send(message);
-                    }
-                    catch (SmtpException ex)
-                    {
-                        throw new ApplicationException("Failed to send email.", ex);
-                    }
-                }
-            }
-
-            Console.WriteLine($"Email sent from: {emailAddresses.Sender} to: {emailAddresses.Recipients}");
-        }
-        catch (Exception ex)
-        {
-            new Logger(_vars).LogError("EmailSend", ex.Message);
-        }
-    }
-
-    private (string Sender, string Recipients) GetEmailAddressesFromDb(string payerName)
-    {
-        var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-
-        using (var conn = new SqlConnection(connStr))
-        {
-            conn.Open();
-            string query = @"SELECT Sender, Recipients 
-                         FROM MoveIt.EmailAddresses 
-                         WHERE PayerName = @PayerName";
-
-            using (var cmd = new SqlCommand(query, conn))
-            {
-                cmd.Parameters.AddWithValue("@PayerName", payerName);
-                using (var reader = cmd.ExecuteReader())
-                {
-                    if (reader.Read())
-                    {
-                        return (
-                            Sender: reader["Sender"]?.ToString() ?? string.Empty,
-                            Recipients: reader["Recipients"]?.ToString() ?? string.Empty
-                        );
-                    }
-                }
-            }
-        }
-
-        return (Sender: string.Empty, Recipients: string.Empty);
-    }
-}
-
-// FileProcessor.cs
-public class FileProcessor
-{
-    private readonly Config _config;
-    private readonly Logger _logger;
-    private readonly Variables _vars;
-
-    public FileProcessor(Config config, Logger logger, Variables vars)
-    {
-        _config = config;
-        _logger = logger;
-        _vars = vars;
-    }
-
-    public void Execute()
-    {
-        var files = GetMatchingFiles();
-        if (files.Length == 0)
-        {
-            // No files detected, do nothing and return
-            return;
-        }
-
-        bool anyNewProcessed = false;
-        bool allDuplicates = true;
-
-        switch (_config.ActionType)
-        {
-            case "Move":
-                anyNewProcessed = ProcessFiles(isMove: true, ref allDuplicates);
-                break;
-            case "Copy":
-                anyNewProcessed = ProcessFiles(isMove: false, ref allDuplicates);
-                break;
-            case "Zip":
-                anyNewProcessed = ZipFiles(ref allDuplicates);
-                break;
-            default:
-                throw new Exception($"Unknown ActionType: {_config.ActionType}");
-        }
-
-        // Summary if all files were duplicates
-        if (files.Length > 0 && _config.Sequence == 1 && allDuplicates)
-        {
-            _logger.LogInfo(_config, "AllDuplicates", "All files were duplicates and moved to archive or skipped.");
-            _vars["User::HasFiles"].Value = false;
-        }
-    }
-
-    public static string[] GetFilesByPatternAndDate(string folder, string pattern, DateTime date)
-    {
-        return Directory.GetFiles(folder, pattern)
-            .Where(file => File.GetLastWriteTime(file).Year == date.Year &&
-                           File.GetLastWriteTime(file).Month == date.Month)
-            .ToArray();
-    }
-
-    private bool ProcessFiles(bool isMove, ref bool allDuplicates)
-    {
-        bool processedAnyNew = false;
-
-        try
-        {
-            ValidateDirectories(_config.SourceFolder, _config.DestinationFolder);
-            EnsureDirectory(_config.ArchiveFolder);
-
-            var files = GetMatchingFiles();
-
-            foreach (var file in files)
-            {
-                var fileName = Path.GetFileName(file);
-                long fileSize = new FileInfo(file).Length;
-
-                if (IsAlreadyProcessed(fileName, _config.MappingID, fileSize))
-                {
-                    MoveToArchiveSafely(file, fileName);
-                    _logger.LogInfo(_config, fileName, $"Duplicate file {fileName} with size {fileSize} moved to archive.");
-                    continue;
-                }
-
-                try
-                {
-                    var dest = Path.Combine(_config.DestinationFolder, fileName);
-                    if (isMove)
-                    {
-                        if (File.Exists(dest)) File.Delete(dest);
-                        File.Move(file, dest);
-                    }
-                    else
-                    {
-                        File.Copy(file, dest, true);
-                    }
-
-                    processedAnyNew = true;
-                    allDuplicates = false;
-                    _logger.LogSuccess(_config, fileName, isMove ? "Moved" : "Copied", fileSize);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(fileName, ex.Message, fileSize);
-                    allDuplicates = false; // treat errors as not duplicates
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError("ProcessFiles", ex.Message);
-            allDuplicates = false;
-        }
-
-        return processedAnyNew;
-    }
-
-    private bool ZipFiles(ref bool allDuplicates)
-    {
-        bool zippedAnything = false;
-
-        try
-        {
-            ValidateDirectories(_config.SourceFolder, _config.DestinationFolder);
-            EnsureDirectory(_config.ArchiveFolder);
-
-            var files = GetMatchingFiles();
-
-            var toZip = files.Where(f => !IsAlreadyProcessed(Path.GetFileName(f), _config.MappingID, new FileInfo(f).Length)).ToArray();
-            var duplicates = files.Except(toZip).ToArray();
-
-            // Archive duplicates
-            foreach (var dup in duplicates)
-            {
-                MoveToArchiveSafely(dup, Path.GetFileName(dup));
-                _logger.LogInfo(_config, Path.GetFileName(dup), $"Duplicate file moved to archive.");
-            }
-
-            if (toZip.Length == 0)
-            {
-                allDuplicates = true;
-                return false; // no new files to zip
-            }
-
-            var zipPath = Path.Combine(_config.DestinationFolder, $"{_config.ZipName}_{DateTime.Now:yyyyMM}.zip");
-
-            using (var zipToOpen = new FileStream(zipPath, FileMode.OpenOrCreate))
-            using (var archive = new ZipArchive(zipToOpen, ZipArchiveMode.Update))
-            {
-                foreach (var file in toZip)
-                {
-                    var fileName = Path.GetFileName(file);
-
-                    if (!archive.Entries.Any(e => string.Equals(e.Name, fileName, StringComparison.OrdinalIgnoreCase)))
-                    {
-                        archive.CreateEntryFromFile(file, fileName);
-                        zippedAnything = true;
-                        allDuplicates = false;
-                        _logger.LogSuccess(_config, fileName, "Appended to Zip", new FileInfo(file).Length);
-                    }
-                    else
-                    {
-                        _logger.LogInfo(_config, fileName, "Skipped (already in zip).");
-                    }
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError("ZipFiles", ex.Message);
-            allDuplicates = false;
-        }
-
-        return zippedAnything;
-    }
-
-    private void MoveToArchiveSafely(string sourcePath, string fileName)
-    {
-        try
-        {
-            if (string.IsNullOrWhiteSpace(_config.ArchiveFolder))
-            {
-                _logger.LogError("ArchiveFolder", "ArchiveFolder is empty; cannot move duplicate to archive.");
-                return;
-            }
-
-            // Get file last write time for folder naming
-            var fileDate = File.GetLastWriteTime(sourcePath);
-            var monthFolder = Path.Combine(_config.ArchiveFolder, fileDate.ToString("yyyyMM"));
-
-            EnsureDirectory(monthFolder);
-
-            var dest = Path.Combine(monthFolder, fileName);
-
-            if (File.Exists(sourcePath))
-            {
-                if (File.Exists(dest)) File.Delete(dest);
-                File.Move(sourcePath, dest);
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError($"Archive:{fileName}", ex.Message);
-        }
-    }
-
-    private string[] GetMatchingFiles()
-    {
-        var exclusions = _config.ExclusionList.Split(new char[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-        return Directory.GetFiles(_config.SourceFolder, _config.FilePattern)
-            .Where(file =>
-            {
-                var name = Path.GetFileName(file);
-                return !exclusions.Any(ex => name.IndexOf(ex.Trim(), StringComparison.OrdinalIgnoreCase) >= 0);
-            })
-            .ToArray();
-    }
-
-    private bool IsAlreadyProcessed(string fileName, int mappingID, long fileSize)
-    {
-        var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-
-        using (var conn = new SqlConnection(connStr))
-        {
-            conn.Open();
-            string query = @"SELECT COUNT(*) FROM MoveIt.FileTransferLog 
-                         WHERE FileName = @FileName 
-                           AND MappingID = @MappingID 
-                           AND FileSize = @FileSize
-                           AND Status = 'Success'";
-            using (SqlCommand cmd = new SqlCommand(query, conn))
-            {
-                cmd.Parameters.AddWithValue("@FileName", fileName);
-                cmd.Parameters.AddWithValue("@MappingID", mappingID);
-                cmd.Parameters.AddWithValue("@FileSize", fileSize);
-                return (int)cmd.ExecuteScalar() > 0;
-            }
-        }
-    }
-
-    private void ValidateDirectories(params string[] folders)
-    {
-        foreach (var folder in folders)
-        {
-            if (!Directory.Exists(folder))
-                throw new DirectoryNotFoundException($"Folder not found: {folder}");
-        }
-    }
-
-    private void EnsureDirectory(string folder)
-    {
-        if (!string.IsNullOrWhiteSpace(folder) && !Directory.Exists(folder))
-        {
-            Directory.CreateDirectory(folder);
-        }
-    }
-}
-
-// GetLogSummary.cs
 public static class GetLogSummary
 {
     public static string GenerateHtmlSummary(string payerName, Variables vars)
     {
         var connStr = vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-        var sb = new StringBuilder();
+        var entries = new List<FileLogEntry>();
 
         using (var conn = new SqlConnection(connStr))
         {
             conn.Open();
 
-            // Get the most recent processed time
-            string latestTimeQuery = @"SELECT MAX(ProcessedAt) 
-                               FROM MoveIt.FileTransferLog
-                               WHERE PayerName = @PayerName";
-            DateTime lastProcessedAt;
+            // Get the latest ProcessedAt timestamp for this PayerName
+            string latestTimeQuery = @"
+                SELECT MAX(ProcessedAt) 
+                FROM MoveIt.FileTransferLog
+                WHERE MappingID = (SELECT MappingID FROM MoveIt.EmailAddresses WHERE PayerName = @PayerName)";
+
+            DateTime? latestProcessedAt = null;
             using (var cmd = new SqlCommand(latestTimeQuery, conn))
             {
                 cmd.Parameters.AddWithValue("@PayerName", payerName);
                 var result = cmd.ExecuteScalar();
-                lastProcessedAt = result != DBNull.Value ? Convert.ToDateTime(result) : DateTime.MinValue;
+                if (result != DBNull.Value && result != null)
+                    latestProcessedAt = (DateTime)result;
             }
 
-            // Pull only records after the latest processed time
-            string query = @"SELECT FileName, ActionType, FileSize, Status, ProcessedAt
-                     FROM MoveIt.FileTransferLog
-                     WHERE PayerName = @PayerName
-                       AND ProcessedAt > @LastProcessedAt
-                     ORDER BY ProcessedAt ASC";
+            if (latestProcessedAt == null)
+                return "<p>No files processed for today.</p>";
 
-            using (var cmd = new SqlCommand(query, conn))
+            // Get all log records for that latest ProcessedAt timestamp
+            string logQuery = @"
+                SELECT FileName, ActionType, FileSize, Status, LogMessage 
+                FROM MoveIt.FileTransferLog
+                WHERE MappingID = (SELECT MappingID FROM MoveIt.EmailAddresses WHERE PayerName = @PayerName)
+                  AND ProcessedAt = @ProcessedAt
+                ORDER BY FileName";
+
+            using (var cmd = new SqlCommand(logQuery, conn))
             {
                 cmd.Parameters.AddWithValue("@PayerName", payerName);
-                cmd.Parameters.AddWithValue("@LastProcessedAt", lastProcessedAt);
+                cmd.Parameters.AddWithValue("@ProcessedAt", latestProcessedAt.Value);
 
                 using (var reader = cmd.ExecuteReader())
                 {
-                    sb.AppendLine("<h3>File Processing Summary</h3>");
-                    sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>");
-                    sb.AppendLine("<tr style='background-color:#f2f2f2;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th><th>ProcessedAt</th></tr>");
-
                     while (reader.Read())
                     {
-                        sb.AppendLine($"<tr><td>{reader["FileName"]}</td><td>{reader["ActionType"]}</td><td>{reader["FileSize"]}</td><td>{reader["Status"]}</td><td>{reader["ProcessedAt"]}</td></tr>");
+                        entries.Add(new FileLogEntry
+                        {
+                            FileName = reader["FileName"].ToString(),
+                            Action = reader["ActionType"].ToString(),
+                            FileSize = Convert.ToInt64(reader["FileSize"]),
+                            Status = reader["Status"].ToString()
+                        });
                     }
-
-                    sb.AppendLine("</table>");
                 }
             }
         }
 
+        // Generate HTML
+        if (entries.Count == 0)
+            return "<p>No files processed in the latest batch.</p>";
+
+        var sb = new StringBuilder();
+        sb.AppendLine("<h3>File Processing Summary</h3>");
+        sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>");
+        sb.AppendLine("<tr style='background-color:#f2f2f2;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th></tr>");
+
+        foreach (var entry in entries)
+        {
+            sb.AppendLine($"<tr><td>{entry.FileName}</td><td>{entry.Action}</td><td>{entry.FileSize}</td><td>{entry.Status}</td></tr>");
+        }
+
+        sb.AppendLine("</table>");
         return sb.ToString();
     }
-}
 
-//Logger.cs
-public class Logger
-{
-    private readonly Variables _vars;
-
-    public Logger(Variables vars)
+    public class FileLogEntry
     {
-        _vars = vars;
-    }
-
-    public void LogInfo(Config config, string fileName, string message, long fileSize = 0) =>
-        LogOperation(config, fileName, "Info", message, fileSize);
-
-    public void LogSuccess(Config config, string fileName, string action, long fileSize = 0) =>
-        LogOperation(config, fileName, "Success", $"File {action} successfully.", fileSize);
-
-    public void LogError(string context, string message, long fileSize = 0) =>
-        LogOperation(null, context, "Failure", message, fileSize);
-
-    private void LogOperation(Config config, string fileName, string status, string message, long fileSize = 0)
-    {
-        try
-        {
-            int mappingID = config?.MappingID ?? -1;
-            string actionType = config?.ActionType ?? "Unknown";
-            Console.WriteLine($"[LOG] MappingID: {mappingID}, File: {fileName}, Size: {fileSize}, Status: {status}, Message: {message}");
-            WriteLogToDatabase(mappingID, actionType, fileName, status, message, fileSize);
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Logging failed: {ex.Message}");
-        }
-    }
-
-    private void WriteLogToDatabase(int mappingID, string actionType, string fileName, string status, string message, long fileSize)
-    {
-        var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
-
-        using (var conn = new SqlConnection(connStr))
-        {
-            conn.Open();
-            string query = @"INSERT INTO MoveIt.FileTransferLog 
-                        (MappingID, ActionType, FileName, FileSize, Status, LogMessage, ProcessedAt)
-                        VALUES (@MappingID, @ActionType, @FileName, @FileSize, @Status, @Message, GETDATE())";
-            using (SqlCommand cmd = new SqlCommand(query, conn))
-            {
-                cmd.Parameters.AddWithValue("@MappingID", mappingID);
-                cmd.Parameters.AddWithValue("@ActionType", actionType);
-                cmd.Parameters.AddWithValue("@FileName", fileName);
-                cmd.Parameters.AddWithValue("@FileSize", fileSize);
-                cmd.Parameters.AddWithValue("@Status", status);
-                cmd.Parameters.AddWithValue("@Message", message);
-                cmd.ExecuteNonQuery();
-            }
-        }
+        public string FileName { get; set; }
+        public string Action { get; set; }
+        public long FileSize { get; set; }
+        public string Status { get; set; }
     }
 }
