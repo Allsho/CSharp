@@ -1,48 +1,39 @@
 // Main.cs
-public void Main()
+using System;
+using Microsoft.SqlServer.Dts.Runtime;
+
+public class ScriptMain
 {
-    ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
-    string smtpServer = smtpConnection.Properties["SmtpServer"].GetValue(smtpConnection).ToString();
-
-    try
+    public void Main()
     {
-        var config = Config.LoadFromVariables(Dts.Variables);
+        ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
+        string smtpServer = smtpConnection.Properties["SmtpServer"].GetValue(smtpConnection).ToString();
 
-        // Only process files if there are any
-        if (config.HasFiles)
+        try
         {
-            var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables);
+            // Load configuration from SSIS variables
+            var config = Config.LoadFromVariables(Dts.Variables);
+
+            // Process files
+            var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables, null);
             processor.Execute();
-        }
 
-        // Ensure email is only sent once per package execution
-        bool emailAlreadySent = false;
-        if (Dts.Variables.Contains("User::EmailSent") && Dts.Variables["User::EmailSent"].Value is bool sentFlag)
-        {
-            emailAlreadySent = sentFlag;
-        }
+            // Generate professional log summary directly from database
+            var logSummary = new GetLogSummary(Dts.Variables);
+            string htmlBody = logSummary.GenerateHtml(config.MappingID);
 
-        if (!emailAlreadySent)
-        {
-            // Get a professional summary from the log table
-            var summaryHtml = GetLogSummary.GenerateHtmlSummary(config.PayerName, Dts.Variables);
-
+            // Send summary email
             var emailer = new Emailer(Dts.Variables);
-            emailer.SendEmail(smtpServer, "File Processing Summary", summaryHtml, config.PayerName);
+            emailer.SendEmail(smtpServer, "File Processing Summary", htmlBody, config.PayerName);
 
-            // Mark that email has been sent
-            if (Dts.Variables.Contains("User::EmailSent"))
-                Dts.Variables["User::EmailSent"].Value = true;
-            else
-                Dts.Variables.Add("User::EmailSent", true);
+            Dts.TaskResult = (int)ScriptResults.Success;
+            Console.WriteLine("Main execution completed successfully.");
         }
-
-        Dts.TaskResult = (int)ScriptResults.Success;
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error in Main(): {ex.Message}");
-        new Logger(Dts.Variables).LogError("Main", ex.Message);
-        Dts.TaskResult = (int)ScriptResults.Failure;
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error in Main(): {ex.Message}");
+            new Logger(Dts.Variables).LogError("Main", ex.Message);
+            Dts.TaskResult = (int)ScriptResults.Failure;
+        }
     }
 }
