@@ -1,24 +1,37 @@
 public void Main()
 {
-    ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
-    string smtpServer = smtpConnection.Properties["SmtpServer"].GetValue(smtpConnection).ToString();
-
     try
     {
+        // 🔹 Get SMTP connection from SSIS
+        ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
+        string smtpServer = smtpConnection.Properties["SmtpServer"].GetValue(smtpConnection).ToString();
+
+        // 🔹 Load summary from DB (based on latest ProcessedAt)
         var summary = new EmailSummary();
-        summary.LoadFromDatabase(Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString());
+        string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+        summary.LoadFromDatabase(connStr);
 
+        // 🔹 Generate HTML body
         string htmlBody = summary.GenerateHtml();
-        var emailer = new Emailer(Dts.Variables);
 
-        // Send one email for all payers
+        // If no files were processed, skip sending email
+        if (string.IsNullOrWhiteSpace(htmlBody) || htmlBody.Contains("No files processed"))
+        {
+            Console.WriteLine("No files processed. Email not sent.");
+            Dts.TaskResult = (int)ScriptResults.Success;
+            return;
+        }
+
+        // 🔹 Send email (payerName is optional for lookup, can default to 'All')
+        var emailer = new Emailer(Dts.Variables);
         emailer.SendEmail(smtpServer, "File Processing Summary", htmlBody, "All");
 
         Dts.TaskResult = (int)ScriptResults.Success;
     }
     catch (Exception ex)
     {
-        new Logger(Dts.Variables).LogError("SendSummaryEmail", ex.Message);
+        Console.WriteLine($"Error in Email Script Task: {ex.Message}");
+        new Logger(Dts.Variables).LogError("EmailScriptTask", ex.Message);
         Dts.TaskResult = (int)ScriptResults.Failure;
     }
 }
