@@ -1,17 +1,18 @@
+//Main
 public void Main()
 {
     try
     {
-        // 🔹 Get SMTP connection from SSIS
+        // ?? Get SMTP connection from SSIS
         ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
         string smtpServer = smtpConnection.Properties["SmtpServer"].GetValue(smtpConnection).ToString();
 
-        // 🔹 Load summary from DB (based on latest ProcessedAt)
+        // ?? Load summary from DB (based on latest ProcessedAt)
         var summary = new EmailSummary();
         string connStr = Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString();
         summary.LoadFromDatabase(connStr);
 
-        // 🔹 Generate HTML body
+        // ?? Generate HTML body
         string htmlBody = summary.GenerateHtml();
 
         // If no files were processed, skip sending email
@@ -22,7 +23,7 @@ public void Main()
             return;
         }
 
-        // 🔹 Send email (payerName is optional for lookup, can default to 'All')
+        // ?? Send email (payerName is optional for lookup, can default to 'All')
         var emailer = new Emailer(Dts.Variables);
         emailer.SendEmail(smtpServer, "File Processing Summary", htmlBody, "All");
 
@@ -31,7 +32,188 @@ public void Main()
     catch (Exception ex)
     {
         Console.WriteLine($"Error in Email Script Task: {ex.Message}");
-        new Logger(Dts.Variables).LogError("EmailScriptTask", ex.Message);
         Dts.TaskResult = (int)ScriptResults.Failure;
+    }
+}
+
+//Emailer
+public class Emailer
+{
+    private readonly Variables _vars;
+
+    public Emailer(Variables vars)
+    {
+        _vars = vars;
+    }
+
+    public void SendEmail(string smtpServer, string subject, string htmlBody, string payerName)
+    {
+        try
+        {
+            // Fetch Sender and Recipients from MoveIt.EmailAddresses
+            var emailAddresses = GetEmailAddressesFromDb(payerName);
+
+            if (string.IsNullOrWhiteSpace(emailAddresses.Sender) || string.IsNullOrWhiteSpace(emailAddresses.Recipients))
+            {
+                Console.WriteLine("Sender or Recipients missing. Email not sent.");
+                return;
+            }
+
+            using (var message = new MailMessage())
+            {
+                message.From = new MailAddress(emailAddresses.Sender);
+
+                // Add multiple recipients (comma-separated)
+                foreach (var recipient in emailAddresses.Recipients.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    message.To.Add(recipient.Trim());
+                }
+
+                message.Subject = subject;
+                message.Body = htmlBody;
+                message.IsBodyHtml = true;
+
+                using (var client = new SmtpClient(smtpServer))
+                {
+                    client.UseDefaultCredentials = true;
+
+                    try
+                    {
+                        client.Send(message);
+                    }
+                    catch (SmtpException ex)
+                    {
+                        throw new ApplicationException("Failed to send email.", ex);
+                    }
+                }
+            }
+
+            Console.WriteLine($"Email sent from: {emailAddresses.Sender} to: {emailAddresses.Recipients}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Email sending failed: {ex.Message}");
+        }
+    }
+
+    private (string Sender, string Recipients) GetEmailAddressesFromDb(string payerName)
+    {
+        var connStr = _vars["User::CM_OLEDB_ClaimsStage"].Value.ToString();
+
+        using (var conn = new SqlConnection(connStr))
+        {
+            conn.Open();
+            string query = @"SELECT Sender, Recipients 
+                 FROM MoveIt.EmailAddresses 
+                 WHERE PayerName = @PayerName";
+
+            using (var cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@PayerName", payerName);
+                using (var reader = cmd.ExecuteReader())
+                {
+                    if (reader.Read())
+                    {
+                        return (
+                            Sender: reader["Sender"]?.ToString() ?? string.Empty,
+                            Recipients: reader["Recipients"]?.ToString() ?? string.Empty
+                        );
+                    }
+                }
+            }
+        }
+
+        return (Sender: string.Empty, Recipients: string.Empty);
+    }
+}
+
+// EmailSummary
+public class EmailSummary
+{
+    public class FileLogEntry
+    {
+        public string PayerName { get; set; }
+        public string FileName { get; set; }
+        public string Action { get; set; }
+        public long FileSize { get; set; }
+        public string Status { get; set; }
+        public string Message { get; set; }
+    }
+
+    private readonly List<FileLogEntry> _entries = new List<FileLogEntry>();
+
+    public void LoadFromDatabase(string connStr)
+    {
+        using (var conn = new SqlConnection(connStr))
+        {
+            conn.Open();
+
+            // Get latest ProcessedAt across ALL payers
+            string latestQuery = @"SELECT MAX(ProcessedAt) FROM MoveIt.FileTransferLog";
+            DateTime? latestProcessedAt = null;
+            using (var cmd = new SqlCommand(latestQuery, conn))
+            {
+                var result = cmd.ExecuteScalar();
+                if (result != DBNull.Value)
+                    latestProcessedAt = (DateTime)result;
+            }
+
+            if (latestProcessedAt == null) return;
+
+            // Pull all logs for that run
+            string query = @"
+        SELECT PayerName, FileName, ActionType, FileSize, Status, LogMessage
+        FROM MoveIt.FileTransferLog
+        WHERE ProcessedAt = @ProcessedAt
+        ORDER BY PayerName, FileName";
+
+            using (var cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.AddWithValue("@ProcessedAt", latestProcessedAt);
+
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        _entries.Add(new FileLogEntry
+                        {
+                            PayerName = reader["PayerName"].ToString(),
+                            FileName = reader["FileName"].ToString(),
+                            Action = reader["ActionType"].ToString(),
+                            FileSize = Convert.ToInt64(reader["FileSize"]),
+                            Status = reader["Status"].ToString(),
+                            Message = reader["LogMessage"].ToString()
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    public string GenerateHtml()
+    {
+        if (_entries.Count == 0)
+            return "<p>No files processed.</p>";
+
+        var sb = new StringBuilder();
+        sb.AppendLine("<h2>File Processing Summary</h2>");
+
+        var grouped = _entries.GroupBy(e => e.PayerName);
+
+        foreach (var group in grouped)
+        {
+            sb.AppendLine($"<h3>Payer: {group.Key}</h3>");
+            sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>");
+            sb.AppendLine("<tr style='background-color:#f2f2f2;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th><th>Message</th></tr>");
+
+            foreach (var entry in group)
+            {
+                sb.AppendLine($"<tr><td>{entry.FileName}</td><td>{entry.Action}</td><td>{entry.FileSize}</td><td>{entry.Status}</td><td>{entry.Message}</td></tr>");
+            }
+
+            sb.AppendLine("</table><br/>");
+        }
+
+        return sb.ToString();
     }
 }
