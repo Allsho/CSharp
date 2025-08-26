@@ -1,99 +1,28 @@
-public class EmailSummary
-{
-    public class FileLogEntry
-    {
-        public string PayerName { get; set; }
-        public string FileName { get; set; }
-        public string Action { get; set; }
-        public long FileSize { get; set; }
-        public string Status { get; set; }
-        public string Message { get; set; }
-    }
-
-    private readonly List<FileLogEntry> _entries = new List<FileLogEntry>();
-
-    public void LoadFromDatabase(string connStr)
-    {
-        using (var conn = new SqlConnection(connStr))
+        public void Main()
         {
-            conn.Open();
+            ConnectionManager smtpConnection = Dts.Connections["CM_SMTP_EXHUB"];
+            string smtpServer = smtpConnection.Properties["SmtpServer"].GetValue(smtpConnection).ToString();
 
-            // Get latest ProcessedAt across ALL payers
-            string latestQuery = @"SELECT MAX(ProcessedAt) FROM MoveIt.FileTransferLog";
-            DateTime? latestProcessedAt = null;
-            using (var cmd = new SqlCommand(latestQuery, conn))
+            try
             {
-                var result = cmd.ExecuteScalar();
-                if (result != DBNull.Value)
-                    latestProcessedAt = (DateTime)result;
+                var config = Config.LoadFromVariables(Dts.Variables);
+                var summary = new EmailSummary();
+                var processor = new FileProcessor(config, new Logger(Dts.Variables), Dts.Variables, summary);
+                processor.Execute();
+
+                // Send summary email
+                summary.LoadFromDatabase(Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString());
+
+                string htmlBody = summary.GenerateHtml();
+                var emailer = new Emailer(Dts.Variables);
+                emailer.SendEmail(smtpServer, "File Processing Summary", htmlBody, config.PayerName);
+
+                Dts.TaskResult = (int)ScriptResults.Success;
             }
-
-            if (latestProcessedAt == null) return;
-
-            // Pull all logs for that run
-            string query = @"
-                SELECT PayerName, FileName, ActionType, FileSize, Status, LogMessage
-                FROM MoveIt.FileTransferLog
-                WHERE ProcessedAt = @ProcessedAt
-                ORDER BY PayerName, FileName";
-
-            using (var cmd = new SqlCommand(query, conn))
+            catch (Exception ex)
             {
-                cmd.Parameters.AddWithValue("@ProcessedAt", latestProcessedAt);
-
-                using (var reader = cmd.ExecuteReader())
-                {
-                    while (reader.Read())
-                    {
-                        _entries.Add(new FileLogEntry
-                        {
-                            PayerName = reader["PayerName"].ToString(),
-                            FileName = reader["FileName"].ToString(),
-                            Action = reader["ActionType"].ToString(),
-                            FileSize = Convert.ToInt64(reader["FileSize"]),
-                            Status = reader["Status"].ToString(),
-                            Message = reader["LogMessage"].ToString()
-                        });
-                    }
-                }
+                Console.WriteLine($"Error in Main(): {ex.Message}");
+                new Logger(Dts.Variables).LogError("Main", ex.Message);
+                Dts.TaskResult = (int)ScriptResults.Failure;
             }
         }
-    }
-
-    public string GenerateHtml()
-    {
-        if (_entries.Count == 0)
-            return "<p>No files processed.</p>";
-
-        var sb = new StringBuilder();
-        sb.AppendLine("<h2>File Processing Summary</h2>");
-
-        var grouped = _entries.GroupBy(e => e.PayerName);
-
-        foreach (var group in grouped)
-        {
-            sb.AppendLine($"<h3>Payer: {group.Key}</h3>");
-            sb.AppendLine("<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse;'>");
-            sb.AppendLine("<tr style='background-color:#f2f2f2;'><th>File Name</th><th>Action</th><th>Size (bytes)</th><th>Status</th><th>Message</th></tr>");
-
-            foreach (var entry in group)
-            {
-                sb.AppendLine($"<tr><td>{entry.FileName}</td><td>{entry.Action}</td><td>{entry.FileSize}</td><td>{entry.Status}</td><td>{entry.Message}</td></tr>");
-            }
-
-            sb.AppendLine("</table><br/>");
-        }
-
-        return sb.ToString();
-    }
-}
-
-
-// After processor.Execute();
-var summary = new EmailSummary();
-summary.LoadFromDatabase(Dts.Variables["User::CM_OLEDB_ClaimsStage"].Value.ToString());
-
-string htmlBody = summary.GenerateHtml();
-var emailer = new Emailer(Dts.Variables);
-emailer.SendEmail(smtpServer, "File Processing Summary", htmlBody, config.PayerName);
-
